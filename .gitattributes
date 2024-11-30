@@ -1,0 +1,4 @@
+3DMarkSolarBay-20241020-003039.rra filter=lfs diff=lfs merge=lfs -text
+dxcompiler.dll filter=lfs diff=lfs merge=lfs -text
+dxil.dll filter=lfs diff=lfs merge=lfs -text
+glfw3.dll filter=lfs diff=lfs merge=lfs -text
