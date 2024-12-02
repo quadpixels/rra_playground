@@ -48,18 +48,18 @@ struct RayGenCB
     DirectX::XMMATRIX inverse_view;
     DirectX::XMMATRIX inverse_proj;
 };
-  
+
 constexpr const int WIN_W = 1280, WIN_H = 720;
 constexpr const int FRAME_COUNT = 2;
 
-GLFWwindow* g_window;
-bool                g_use_debug_layer{false};
-ID3D12Device5*      g_device12;
-IDXGIFactory4*      g_factory;
-IDXGISwapChain3*    g_swapchain;
+GLFWwindow*      g_window;
+bool             g_use_debug_layer{false};
+ID3D12Device5*   g_device12;
+IDXGIFactory4*   g_factory;
+IDXGISwapChain3* g_swapchain;
 
-ID3D12CommandQueue* g_command_queue;
-ID3D12CommandAllocator* g_command_allocator;
+ID3D12CommandQueue*         g_command_queue;
+ID3D12CommandAllocator*     g_command_allocator;
 ID3D12GraphicsCommandList4* g_command_list;
 
 ID3D12RootSignature*         g_global_rootsig{};
@@ -78,10 +78,10 @@ ID3D12Resource* g_raygen_sbt_storage;
 ID3D12Resource* g_hit_sbt_storage;
 ID3D12Resource* g_miss_sbt_storage;
 
-ID3D12Fence*        g_fence;
-int                 g_fence_value;
-HANDLE              g_fence_event;
-int                 g_frame_index;
+ID3D12Fence* g_fence;
+int          g_fence_value;
+HANDLE       g_fence_event;
+int          g_frame_index;
 
 void CE(HRESULT x)
 {
@@ -265,7 +265,7 @@ void InitDeviceAndCommandQ()
     }
 
     D3D12_COMMAND_QUEUE_DESC qdesc{};
-    qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qdesc.Type  = D3D12_COMMAND_LIST_TYPE_DIRECT;
     qdesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     CE(g_device12->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&g_command_queue)));
     CE(g_device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)));
@@ -276,24 +276,24 @@ void InitDeviceAndCommandQ()
 void InitSwapChain()
 {
     DXGI_SWAP_CHAIN_DESC1 scd{};
-    scd.BufferCount = FRAME_COUNT;
-    scd.Width       = WIN_W;
-    scd.Height      = WIN_H;
-    scd.Format      = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.BufferCount      = FRAME_COUNT;
+    scd.Width            = WIN_W;
+    scd.Height           = WIN_H;
+    scd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.SampleDesc.Count = 1;
     CE(g_factory->CreateSwapChainForHwnd(g_command_queue, glfwGetWin32Window(g_window), &scd, nullptr, nullptr, (IDXGISwapChain1**)&g_swapchain));
     printf("Created swapchain.\n");
 
     // RTV heap
     D3D12_DESCRIPTOR_HEAP_DESC dhd{};
-    dhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    dhd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     dhd.NumDescriptors = FRAME_COUNT;
     dhd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     CE(g_device12->CreateDescriptorHeap(&dhd, IID_PPV_ARGS(&g_rtv_heap)));
 
-    g_rtv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_rtv_descriptor_size                  = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
     for (int i = 0; i < FRAME_COUNT; i++)
     {
@@ -324,8 +324,8 @@ void InitDX12Stuff()
     desc.MipLevels        = 1;
     desc.SampleDesc.Count = 1;
     D3D12_HEAP_PROPERTIES props{};
-    props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
     props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
     props.CreationNodeMask     = 1;
     props.VisibleNodeMask      = 1;
@@ -343,7 +343,7 @@ void InitDX12Stuff()
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // UAV
-    D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_CPU_DESCRIPTOR_HANDLE      handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
     uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_device12->CreateUnorderedAccessView(g_rt_output_resource, nullptr, &uav_desc, handle);
@@ -381,9 +381,9 @@ void CreateRTPipeline()
         desc_ranges[3].RegisterSpace                     = 0;
         desc_ranges[3].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        root_params[0].DescriptorTable.pDescriptorRanges = desc_ranges;
+        root_params[0].DescriptorTable.pDescriptorRanges   = desc_ranges;
         root_params[0].DescriptorTable.NumDescriptorRanges = 4;
-        root_params[0].ShaderVisibility                  = D3D12_SHADER_VISIBILITY_ALL;
+        root_params[0].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootsig_desc{};
         rootsig_desc.NumStaticSamplers = 0;
@@ -395,7 +395,7 @@ void CreateRTPipeline()
         D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
         if (error)
         {
-          printf("Error: %s\n", (char*)(error->GetBufferPointer()));
+            printf("Error: %s\n", (char*)(error->GetBufferPointer()));
         }
         CE(g_device12->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_global_rootsig)));
         signature->Release();
@@ -409,17 +409,17 @@ void CreateRTPipeline()
         subobjects.reserve(8);
 
         // 1. DXIL Library
-        IDxcBlob*               dxil_library = CompileShaderLibrary(L"shaders/primaryray.hlsl");
-        D3D12_EXPORT_DESC       dxil_lib_exports[3];
-        dxil_lib_exports[0].Flags                 = D3D12_EXPORT_FLAG_NONE;
-        dxil_lib_exports[0].ExportToRename        = nullptr;
-        dxil_lib_exports[0].Name                  = L"RayGen";
-        dxil_lib_exports[1].Flags                 = D3D12_EXPORT_FLAG_NONE;
-        dxil_lib_exports[1].ExportToRename        = nullptr;
-        dxil_lib_exports[1].Name                  = L"ClosestHit";
-        dxil_lib_exports[2].Flags                 = D3D12_EXPORT_FLAG_NONE;
-        dxil_lib_exports[2].ExportToRename        = nullptr;
-        dxil_lib_exports[2].Name                  = L"Miss";
+        IDxcBlob*         dxil_library = CompileShaderLibrary(L"shaders/primaryray.hlsl");
+        D3D12_EXPORT_DESC dxil_lib_exports[3];
+        dxil_lib_exports[0].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[0].ExportToRename = nullptr;
+        dxil_lib_exports[0].Name           = L"RayGen";
+        dxil_lib_exports[1].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[1].ExportToRename = nullptr;
+        dxil_lib_exports[1].Name           = L"ClosestHit";
+        dxil_lib_exports[2].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[2].ExportToRename = nullptr;
+        dxil_lib_exports[2].Name           = L"Miss";
 
         D3D12_DXIL_LIBRARY_DESC dxil_lib_desc{};
         dxil_lib_desc.DXILLibrary.pShaderBytecode = dxil_library->GetBufferPointer();
@@ -428,7 +428,7 @@ void CreateRTPipeline()
         dxil_lib_desc.pExports                    = dxil_lib_exports;
 
         D3D12_STATE_SUBOBJECT subobj_dxil_lib{};
-        subobj_dxil_lib.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+        subobj_dxil_lib.Type  = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
         subobj_dxil_lib.pDesc = &dxil_lib_desc;
         subobjects.push_back(subobj_dxil_lib);
 
@@ -437,13 +437,13 @@ void CreateRTPipeline()
         shader_config.MaxAttributeSizeInBytes = 8;   // float2 bary
         shader_config.MaxPayloadSizeInBytes   = 16;  // float4 color
         D3D12_STATE_SUBOBJECT subobj_shaderconfig{};
-        subobj_shaderconfig.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+        subobj_shaderconfig.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
         subobj_shaderconfig.pDesc = &shader_config;
         subobjects.push_back(subobj_shaderconfig);
 
         // 3. Global Root Signature
         D3D12_STATE_SUBOBJECT subobj_global_rootsig{};
-        subobj_global_rootsig.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+        subobj_global_rootsig.Type  = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
         subobj_global_rootsig.pDesc = &g_global_rootsig;
         subobjects.push_back(subobj_global_rootsig);
 
@@ -451,7 +451,7 @@ void CreateRTPipeline()
         D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config{};
         pipeline_config.MaxTraceRecursionDepth = 1;
         D3D12_STATE_SUBOBJECT subobj_pipeline_config{};
-        subobj_pipeline_config.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+        subobj_pipeline_config.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
         subobj_pipeline_config.pDesc = &pipeline_config;
         subobjects.push_back(subobj_pipeline_config);
 
@@ -477,21 +477,21 @@ void CreateRTPipeline()
 
     // CB and CBV
     D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-    heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap_props.Type                 = D3D12_HEAP_TYPE_UPLOAD;
+    heap_props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
     heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
     heap_props.CreationNodeMask     = 1;
     heap_props.VisibleNodeMask      = 1;
 
     D3D12_RESOURCE_DESC cb_desc{};
-    cb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    cb_desc.Alignment = 0;
-    cb_desc.Width     = 256;
-    cb_desc.Height    = 1;
-    cb_desc.DepthOrArraySize = 1;
-    cb_desc.MipLevels        = 1;
-    cb_desc.Format           = DXGI_FORMAT_UNKNOWN;
-    cb_desc.SampleDesc.Count = 1;
+    cb_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    cb_desc.Alignment          = 0;
+    cb_desc.Width              = 256;
+    cb_desc.Height             = 1;
+    cb_desc.DepthOrArraySize   = 1;
+    cb_desc.MipLevels          = 1;
+    cb_desc.Format             = DXGI_FORMAT_UNKNOWN;
+    cb_desc.SampleDesc.Count   = 1;
     cb_desc.SampleDesc.Quality = 0;
     cb_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     cb_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
@@ -519,7 +519,7 @@ void CreateShaderBindingTable()
     void* miss_shader_id   = g_rt_state_object_props->GetShaderIdentifier(L"Miss");
 
     int shader_record_size = RoundUp(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, 64);
-    
+
     D3D12_RESOURCE_DESC sbt_desc{};
     sbt_desc.DepthOrArraySize   = 1;
     sbt_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -567,11 +567,11 @@ void Render()
 
     float bg_color[] = {0.8f, 1.0f, 0.8f, 1.0f};
     CE(g_command_list->Reset(g_command_allocator, nullptr));
-    
+
     D3D12_RESOURCE_BARRIER barrier_rtv{};
-    barrier_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier_rtv.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier_rtv.Transition.pResource = g_rendertargets[g_frame_index];
+    barrier_rtv.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier_rtv.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier_rtv.Transition.pResource   = g_rendertargets[g_frame_index];
     barrier_rtv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -626,12 +626,11 @@ void Render()
     CE(g_command_allocator->Reset());
 }
 
-void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
-  const std::vector<InstanceInfo>& inst_infos)
+void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vector<InstanceInfo>& inst_infos)
 {
     std::vector<ID3D12Resource*> blases;
     std::vector<ID3D12Resource*> transform_buffers;
-    
+
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instance_descs;
     ID3D12Resource*                             tlas_insts;
 
@@ -641,9 +640,9 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
 
     for (uint32_t i_blas = 0; i_blas < vertices.size(); i_blas++)
     {
-        ID3D12Resource*                verts_buf;
-        size_t                         num_verts  = vertices[i_blas].size();
-        const std::vector<Vertex>*           verts     = &(vertices[i_blas]);
+        ID3D12Resource*            verts_buf;
+        size_t                     num_verts = vertices[i_blas].size();
+        const std::vector<Vertex>* verts     = &(vertices[i_blas]);
 
         std::vector<Vertex> dummy = {{{0, 0, 0}}, {{0, 1, 0}}, {{1, 0, 0}}};
 
@@ -653,33 +652,34 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
             verts     = &dummy;
         }
 
-        size_t                         verts_size = sizeof(Vertex) * num_verts;
+        size_t verts_size = sizeof(Vertex) * num_verts;
 
         blas_offsets.push_back(all_verts.size());
         all_verts.insert(all_verts.end(), verts->begin(), verts->end());
 
         D3D12_HEAP_PROPERTIES heap_props{};
-        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-        heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap_props.Type                 = D3D12_HEAP_TYPE_UPLOAD;
+        heap_props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
         heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
         heap_props.CreationNodeMask     = 1;
         heap_props.VisibleNodeMask      = 1;
 
         D3D12_RESOURCE_DESC res_desc{};
-        res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        res_desc.Alignment = 0;
-        res_desc.Width     = verts_size;
-        res_desc.Height    = 1;
-        res_desc.DepthOrArraySize = 1;
-        res_desc.MipLevels        = 1;
-        res_desc.Format           = DXGI_FORMAT_UNKNOWN;
-        res_desc.SampleDesc.Count = 1;
+        res_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+        res_desc.Alignment          = 0;
+        res_desc.Width              = verts_size;
+        res_desc.Height             = 1;
+        res_desc.DepthOrArraySize   = 1;
+        res_desc.MipLevels          = 1;
+        res_desc.Format             = DXGI_FORMAT_UNKNOWN;
+        res_desc.SampleDesc.Count   = 1;
         res_desc.SampleDesc.Quality = 0;
         res_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         res_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
 
-        CE(g_device12->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&verts_buf)));
-        char* mapped{nullptr};
+        CE(g_device12->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&verts_buf)));
+        char*       mapped{nullptr};
         D3D12_RANGE read_range{};
         read_range.Begin = 0;
         read_range.End   = 0;
@@ -688,8 +688,8 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
         verts_buf->Unmap(0, nullptr);
 
         D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
-        geom_desc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geom_desc.Triangles.VertexBuffer.StartAddress = verts_buf->GetGPUVirtualAddress();
+        geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geom_desc.Triangles.VertexBuffer.StartAddress  = verts_buf->GetGPUVirtualAddress();
         geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
         geom_desc.Triangles.VertexCount                = num_verts;
         geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -698,7 +698,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
         geom_desc.Triangles.IndexCount                 = 0;
         geom_desc.Triangles.Transform3x4               = 0;
         //transform_buf->GetGPUVirtualAddress();
-        geom_desc.Flags                                = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        geom_desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
         inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
@@ -745,11 +745,11 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
             &heap_props, D3D12_HEAP_FLAG_NONE, &result_desc, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&blas_result)));
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc{};
-        build_desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-        build_desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        build_desc.Inputs.NumDescs    = 1;
-        build_desc.Inputs.pGeometryDescs = &geom_desc;
-        build_desc.DestAccelerationStructureData = blas_result->GetGPUVirtualAddress();
+        build_desc.Inputs.Type                      = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        build_desc.Inputs.DescsLayout               = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        build_desc.Inputs.NumDescs                  = 1;
+        build_desc.Inputs.pGeometryDescs            = &geom_desc;
+        build_desc.DestAccelerationStructureData    = blas_result->GetGPUVirtualAddress();
         build_desc.ScratchAccelerationStructureData = blas_scratch->GetGPUVirtualAddress();
         build_desc.SourceAccelerationStructureData  = 0;
         build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
@@ -759,7 +759,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
         g_command_list->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
 
         D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = blas_result;
         g_command_list->ResourceBarrier(1, &barrier);
 
@@ -820,15 +820,15 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
     }
 
     D3D12_RESOURCE_DESC tlas_insts_desc_desc{};
-    tlas_insts_desc_desc.Alignment = 0;
-    tlas_insts_desc_desc.DepthOrArraySize = 1;
-    tlas_insts_desc_desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    tlas_insts_desc_desc.Flags            = D3D12_RESOURCE_FLAG_NONE;
-    tlas_insts_desc_desc.Format           = DXGI_FORMAT_UNKNOWN;
-    tlas_insts_desc_desc.Height           = 1;
-    tlas_insts_desc_desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    tlas_insts_desc_desc.MipLevels        = 1;
-    tlas_insts_desc_desc.SampleDesc.Count = 1;
+    tlas_insts_desc_desc.Alignment          = 0;
+    tlas_insts_desc_desc.DepthOrArraySize   = 1;
+    tlas_insts_desc_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    tlas_insts_desc_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+    tlas_insts_desc_desc.Format             = DXGI_FORMAT_UNKNOWN;
+    tlas_insts_desc_desc.Height             = 1;
+    tlas_insts_desc_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    tlas_insts_desc_desc.MipLevels          = 1;
+    tlas_insts_desc_desc.SampleDesc.Count   = 1;
     tlas_insts_desc_desc.SampleDesc.Quality = 0;
     tlas_insts_desc_desc.Width              = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * instance_descs.size();
 
@@ -849,8 +849,8 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_inputs{};
     tlas_inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-    tlas_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tlas_inputs.NumDescs      = instance_descs.size();
+    tlas_inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    tlas_inputs.NumDescs       = instance_descs.size();
     tlas_inputs.pGeometryDescs = nullptr;
     tlas_inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
 
@@ -915,9 +915,9 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
     D3D12_CPU_DESCRIPTOR_HANDLE srv_handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
     srv_handle.ptr += g_srv_uav_cbv_descriptor_size;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-    srv_desc.Format = DXGI_FORMAT_UNKNOWN;
-    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Format                                   = DXGI_FORMAT_UNKNOWN;
+    srv_desc.ViewDimension                            = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    srv_desc.Shader4ComponentMapping                  = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_desc.RaytracingAccelerationStructure.Location = tlas_result->GetGPUVirtualAddress();
     g_device12->CreateShaderResourceView(nullptr, &srv_desc, srv_handle);
 
@@ -958,10 +958,10 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
     srv_handle = D3D12_CPU_DESCRIPTOR_HANDLE(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
     srv_handle.ptr += 3 * g_srv_uav_cbv_descriptor_size;
 
-    srv_desc = {};
-    srv_desc.Buffer.FirstElement = 0;
-    srv_desc.Buffer.Flags        = D3D12_BUFFER_SRV_FLAG_NONE;
-    srv_desc.Buffer.NumElements  = all_verts.size();
+    srv_desc                            = {};
+    srv_desc.Buffer.FirstElement        = 0;
+    srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+    srv_desc.Buffer.NumElements         = all_verts.size();
     srv_desc.Buffer.StructureByteStride = sizeof(Vertex);
     srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
     srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -969,7 +969,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices,
     g_device12->CreateShaderResourceView(d_all_verts, &srv_desc, srv_handle);
 
     srv_handle.ptr += g_srv_uav_cbv_descriptor_size;
-    srv_desc.Buffer.NumElements = inst_offsets.size();
+    srv_desc.Buffer.NumElements         = inst_offsets.size();
     srv_desc.Buffer.StructureByteStride = sizeof(int);
     g_device12->CreateShaderResourceView(d_inst_offsets, &srv_desc, srv_handle);
 }
@@ -1047,7 +1047,7 @@ void LoadCubeAndCreateAS()
 
     glm::mat4 view = glm::lookAt(eye, center, up);
     glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
-    
+
     glm::mat4 inv_view = glm::inverse(view);
     glm::mat4 inv_proj = glm::inverse(proj);
 
@@ -1110,7 +1110,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
 
     // BLAS's vertices
     std::vector<std::vector<Vertex>> vertices;
-    uint32_t                                    tot_tri_count{0};
+    uint32_t                         tot_tri_count{0};
 
     // Rays
     {
@@ -1309,7 +1309,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     }
 
     CreateAS(vertices, tlas0_inst_infos);
-    
+
     // Set Camera
     glm::vec3 eye(5.964f, 1.691f, 5.374f);
     glm::vec3 center(2.921f, 1.691f, 2.120f);
@@ -1340,7 +1340,7 @@ int main(int argc, char** argv)
 
     CreateRTPipeline();
     CreateShaderBindingTable();
-    
+
     if (1)
     {
         const char* rra_file_name = "3DMarkSolarBay-20241020-003039.rra";
