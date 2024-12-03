@@ -1,5 +1,5 @@
 RaytracingAccelerationStructure Scene : register(t0, space0);
-StructuredBuffer<float4> Vertices : register(t1);
+StructuredBuffer<float3> Vertices : register(t1);
 StructuredBuffer<int> InstanceVertOffsets : register(t2);
 
 RWTexture2D<float4> RenderTarget : register(u0);
@@ -33,6 +33,7 @@ cbuffer RayGenCB : register(b0)
 {
     float4x4 inverse_view;
     float4x4 inverse_proj;
+    bool invert_y;
 };
 
 
@@ -53,6 +54,8 @@ void RayGen()
     RayDesc ray;
     ray.Origin = TransformPosition(inverse_view, float3(0, 0, 0));
     float2 d = (((DispatchRaysIndex().xy + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
+    if (invert_y)
+        d.y *= -1;
     float3 target = TransformPosition(inverse_proj, float3(d.x, -d.y, 1));
     ray.Direction = TransformDirection(inverse_view, normalize(target));
     ray.TMin = 0.001;

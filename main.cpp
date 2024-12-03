@@ -3,9 +3,12 @@
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <thread>
 
 #include <GLFW/glfw3.h>
 #include <glfw/glfw3.h>
@@ -34,6 +37,18 @@
 #undef min
 #undef max
 
+struct CamParams
+{
+    glm::vec3 eye, center, up;
+    bool      invert_y;
+};
+
+std::map<std::string, CamParams> CAM_PARAMS = {
+    {"SolarBay", {glm::vec3(5.964f, 1.691f, 5.374f), glm::vec3(2.921f, 1.691f, 2.120f), glm::vec3(0, 1, 0), false}},
+    {"PortRoyal", {glm::vec3(-7.2252469f, 0.8361527f, 25.2023430f), glm::vec3(-6.8860960f, 0.8613553f, 24.2284565f), glm::vec3(0, 1, 0), true}},
+    {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
+    {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}}};
+
 struct Vertex
 {
     DirectX::XMFLOAT3 position;
@@ -47,9 +62,10 @@ struct RayGenCB
 {
     DirectX::XMMATRIX inverse_view;
     DirectX::XMMATRIX inverse_proj;
+    bool              invert_y;
 };
 
-constexpr const int WIN_W = 1280, WIN_H = 720;
+int WIN_W = 1280, WIN_H = 720;
 constexpr const int FRAME_COUNT = 2;
 
 GLFWwindow*      g_window;
@@ -59,8 +75,10 @@ IDXGIFactory4*   g_factory;
 IDXGISwapChain3* g_swapchain;
 
 ID3D12CommandQueue*         g_command_queue;
-ID3D12CommandAllocator*     g_command_allocator;
-ID3D12GraphicsCommandList4* g_command_list;
+ID3D12CommandAllocator*     g_command_allocator;   // For rendering
+ID3D12CommandAllocator*     g_command_allocator1;  // For building AS
+ID3D12GraphicsCommandList4* g_command_list;   // For rendering
+ID3D12GraphicsCommandList4* g_command_list1;  // For building AS
 
 ID3D12RootSignature*         g_global_rootsig{};
 ID3D12StateObject*           g_rt_state_object;
@@ -82,6 +100,10 @@ ID3D12Fence* g_fence;
 int          g_fence_value;
 HANDLE       g_fence_event;
 int          g_frame_index;
+
+const char* g_rra_file_name;
+
+std::atomic<bool> g_as_built{false};
 
 void CE(HRESULT x)
 {
@@ -311,6 +333,10 @@ void InitDX12Stuff()
     CE(g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_command_allocator)));
     CE(g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_command_allocator, nullptr, IID_PPV_ARGS(&g_command_list)));
     g_command_list->Close();
+
+    CE(g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_command_allocator1)));
+    CE(g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_command_allocator, nullptr, IID_PPV_ARGS(&g_command_list1)));
+    g_command_list1->Close();
 
     // RT output resource
     D3D12_RESOURCE_DESC desc{};
@@ -577,47 +603,56 @@ void Render()
     barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
     g_command_list->ResourceBarrier(1, &barrier_rtv);
 
-    D3D12_RESOURCE_BARRIER barrier_rt_out = barrier_rtv;
-    barrier_rt_out.Transition.pResource   = g_rt_output_resource;
-    barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    g_command_list->ResourceBarrier(1, &barrier_rt_out);
 
     g_command_list->ClearRenderTargetView(handle_rtv, bg_color, 0, nullptr);
 
-    // Dispath ray
-    g_command_list->SetComputeRootSignature(g_global_rootsig);
-    g_command_list->SetPipelineState1(g_rt_state_object);
-    D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
-    g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
-    g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+    if (g_as_built)
+    {
+        D3D12_RESOURCE_BARRIER barrier_rt_out = barrier_rtv;
+        barrier_rt_out.Transition.pResource   = g_rt_output_resource;
+        barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        g_command_list->ResourceBarrier(1, &barrier_rt_out);
+        // Dispath ray
+        g_command_list->SetComputeRootSignature(g_global_rootsig);
+        g_command_list->SetPipelineState1(g_rt_state_object);
+        D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+        g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
+        g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
 
-    D3D12_DISPATCH_RAYS_DESC desc{};
-    desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
-    desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-    desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
-    desc.MissShaderTable.SizeInBytes            = 64;
-    desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
-    desc.HitGroupTable.SizeInBytes              = 64;
-    desc.Width                                  = WIN_W;
-    desc.Height                                 = WIN_H;
-    desc.Depth                                  = 1;
+        D3D12_DISPATCH_RAYS_DESC desc{};
+        desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
+        desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+        desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
+        desc.MissShaderTable.SizeInBytes            = 64;
+        desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
+        desc.HitGroupTable.SizeInBytes              = 64;
+        desc.Width                                  = WIN_W;
+        desc.Height                                 = WIN_H;
+        desc.Depth                                  = 1;
 
-    g_command_list->DispatchRays(&desc);
+        g_command_list->DispatchRays(&desc);
 
-    barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g_command_list->ResourceBarrier(1, &barrier_rt_out);
+        barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_command_list->ResourceBarrier(1, &barrier_rt_out);
 
-    barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    g_command_list->ResourceBarrier(1, &barrier_rtv);
+        barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_command_list->ResourceBarrier(1, &barrier_rtv);
 
-    g_command_list->CopyResource(g_rendertargets[g_frame_index], g_rt_output_resource);
+        g_command_list->CopyResource(g_rendertargets[g_frame_index], g_rt_output_resource);
 
-    barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    g_command_list->ResourceBarrier(1, &barrier_rtv);
+        barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        g_command_list->ResourceBarrier(1, &barrier_rtv);
+    }
+    else
+    {
+        barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        g_command_list->ResourceBarrier(1, &barrier_rtv);
+    }
 
     CE(g_command_list->Close());
     g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_command_list);
@@ -755,16 +790,16 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
 
         // Build BLAS
-        g_command_list->Reset(g_command_allocator, nullptr);
-        g_command_list->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
+        g_command_list1->Reset(g_command_allocator1, nullptr);
+        g_command_list1->BuildRaytracingAccelerationStructure(&build_desc, 0, nullptr);
 
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barrier.UAV.pResource = blas_result;
-        g_command_list->ResourceBarrier(1, &barrier);
+        g_command_list1->ResourceBarrier(1, &barrier);
 
-        g_command_list->Close();
-        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list));
+        g_command_list1->Close();
+        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
         WaitForPreviousFrame();
 
         blas_scratch->Release();
@@ -897,16 +932,16 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     tlas_build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
 
     // Build BLAS
-    g_command_list->Reset(g_command_allocator, nullptr);
-    g_command_list->BuildRaytracingAccelerationStructure(&tlas_build_desc, 0, nullptr);
+    g_command_list1->Reset(g_command_allocator1, nullptr);
+    g_command_list1->BuildRaytracingAccelerationStructure(&tlas_build_desc, 0, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = tlas_result;
-    g_command_list->ResourceBarrier(1, &barrier);
+    g_command_list1->ResourceBarrier(1, &barrier);
 
-    g_command_list->Close();
-    g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list));
+    g_command_list1->Close();
+    g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
     WaitForPreviousFrame();
 
     tlas_scratch->Release();
@@ -1056,6 +1091,7 @@ void LoadCubeAndCreateAS()
     RayGenCB cb{};
     GlmMat4ToDirectXMatrix(&cb.inverse_view, inv_view);
     GlmMat4ToDirectXMatrix(&cb.inverse_proj, inv_proj);
+    cb.invert_y = false;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 }
@@ -1186,7 +1222,8 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                         RraBlasGetSurfaceArea(i, ch, &sa);
                         if (sa <= 0)
                         {
-                            printf("BLAS[%u]'s node %08X's surface area is zero\n", i, ch);
+                            printf("BLAS[%u]'s node %08X's surface area is zero. Skipping.\n", i, ch);
+                            continue;
                         }
 
                         uint32_t tc{};
@@ -1311,10 +1348,23 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     CreateAS(vertices, tlas0_inst_infos);
 
     // Set Camera
-    glm::vec3 eye(5.964f, 1.691f, 5.374f);
-    glm::vec3 center(2.921f, 1.691f, 2.120f);
-
+    glm::vec3 eye(0, 0, 0);
+    glm::vec3 center(0, 1, 0);
     glm::vec3 up(0, 1, 0);
+    bool      invert_y = false;
+
+    std::string fn(g_rra_file_name);
+    for (const auto& entry : CAM_PARAMS)
+    {
+        if (fn.find(entry.first) != std::string::npos)
+        {
+            printf("Using camera params for %s\n", entry.first.c_str());
+            eye      = entry.second.eye;
+            center   = entry.second.center;
+            up       = entry.second.up;
+            invert_y = entry.second.invert_y;
+        }
+    }
 
     glm::mat4 view = glm::lookAt(eye, center, up);
     glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
@@ -1327,12 +1377,41 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     RayGenCB cb{};
     GlmMat4ToDirectXMatrix(&cb.inverse_view, inv_view);
     GlmMat4ToDirectXMatrix(&cb.inverse_proj, inv_proj);
+    cb.invert_y = invert_y;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 }
 
 int main(int argc, char** argv)
 {
+    g_rra_file_name      = "3DMarkSolarBay-20241020-003039.rra";
+    bool rra_file_exists = true;
+
+    for (int i = 0; i < argc; i++)
+    {
+        if (!strcmp(argv[i], "-w") && i + 1 < argc)
+        {
+            WIN_W = std::atoi(argv[i + 1]);
+            i++;
+        }
+        else if (!strcmp(argv[i], "-h") && i + 1 < argc)
+        {
+            WIN_H = std::atoi(argv[i + 1]);
+            i++;
+        }
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc)
+        {
+            g_rra_file_name = argv[i + 1];
+            i++;
+        }
+    }
+
+    if (!std::filesystem::exists(g_rra_file_name))
+    {
+        printf("Oh! file %s does not exist. Will show a cube instead.\n", g_rra_file_name);
+        rra_file_exists = false;
+    }
+
     CreateMyRRALoaderWindow();
     InitDeviceAndCommandQ();
     InitSwapChain();
@@ -1341,20 +1420,25 @@ int main(int argc, char** argv)
     CreateRTPipeline();
     CreateShaderBindingTable();
 
-    if (1)
-    {
-        const char* rra_file_name = "3DMarkSolarBay-20241020-003039.rra";
-        LoadRRAFileAndCreateAS(rra_file_name);
-    }
-    else
-    {
-        LoadCubeAndCreateAS();
-    }
+    std::thread thd([&]() {
+        if (rra_file_exists)
+        {
+            LoadRRAFileAndCreateAS(g_rra_file_name);
+        }
+        else
+        {
+            LoadCubeAndCreateAS();
+        }
+        g_as_built = true;
+    });
 
     while (!glfwWindowShouldClose(g_window))
     {
         Render();
         glfwPollEvents();
     }
+
+    thd.join();
+
     return 0;
 }
