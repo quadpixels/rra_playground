@@ -83,6 +83,8 @@ ID3D12GraphicsCommandList4* g_command_list1;  // For building AS
 ID3D12RootSignature*         g_global_rootsig{};
 ID3D12StateObject*           g_rt_state_object;
 ID3D12StateObjectProperties* g_rt_state_object_props;
+ID3D12StateObject*           g_rt_state_object_ao;
+ID3D12StateObjectProperties* g_rt_state_object_props_ao;
 
 ID3D12DescriptorHeap* g_rtv_heap;
 ID3D12DescriptorHeap* g_srv_uav_cbv_heap;
@@ -92,9 +94,16 @@ ID3D12Resource*       g_rendertargets[FRAME_COUNT];
 
 ID3D12Resource* g_rt_output_resource;
 ID3D12Resource* g_raygen_cb;
+
 ID3D12Resource* g_raygen_sbt_storage;
 ID3D12Resource* g_hit_sbt_storage;
 ID3D12Resource* g_miss_sbt_storage;
+
+ID3D12Resource* g_raygen_sbt_storage_ao;
+ID3D12Resource* g_hit_sbt_storage_ao;
+ID3D12Resource* g_miss_sbt_storage_ao;
+
+bool g_use_ao{false};
 
 ID3D12Fence* g_fence;
 int          g_fence_value;
@@ -201,18 +210,27 @@ IDxcBlob* CompileShaderLibrary(LPCWSTR fileName)
 
 void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
-    switch (key)
+    if (action == GLFW_PRESS)
     {
-    case GLFW_KEY_0:
-    {
-        break;
-    }
-    case GLFW_KEY_ESCAPE:
-    {
-        exit(0);
-    }
-    default:
-        break;
+        switch (key)
+        {
+        case GLFW_KEY_0:
+        {
+            break;
+        }
+        case GLFW_KEY_ESCAPE:
+        {
+            exit(0);
+            break;
+        }
+        case GLFW_KEY_SPACE:
+        {
+            g_use_ao = !g_use_ao;
+            break;
+        }
+        default:
+            break;
+        }
     }
 }
 
@@ -429,7 +447,7 @@ void CreateRTPipeline()
             error->Release();
     }
 
-    // 2. RTPSO
+    // 2. RTPSO for primary ray
     {
         std::vector<D3D12_STATE_SUBOBJECT> subobjects;
         subobjects.reserve(8);
@@ -461,7 +479,7 @@ void CreateRTPipeline()
         // 2. Shader Config
         D3D12_RAYTRACING_SHADER_CONFIG shader_config{};
         shader_config.MaxAttributeSizeInBytes = 8;   // float2 bary
-        shader_config.MaxPayloadSizeInBytes   = 16;  // float4 color
+        shader_config.MaxPayloadSizeInBytes   = 32;  // float4 color
         D3D12_STATE_SUBOBJECT subobj_shaderconfig{};
         subobj_shaderconfig.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
         subobj_shaderconfig.pDesc = &shader_config;
@@ -499,6 +517,78 @@ void CreateRTPipeline()
         CE(g_device12->CreateStateObject(&rtpso_desc, IID_PPV_ARGS(&g_rt_state_object)));
 
         g_rt_state_object->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props));
+    }
+
+    // RTPSO for AO rays
+    {
+        std::vector<D3D12_STATE_SUBOBJECT> subobjects;
+        subobjects.reserve(8);
+
+        // 1. DXIL Library
+        IDxcBlob*         dxil_library = CompileShaderLibrary(L"shaders/aoray.hlsl");
+        D3D12_EXPORT_DESC dxil_lib_exports[3];
+        dxil_lib_exports[0].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[0].ExportToRename = nullptr;
+        dxil_lib_exports[0].Name           = L"RayGen";
+        dxil_lib_exports[1].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[1].ExportToRename = nullptr;
+        dxil_lib_exports[1].Name           = L"ClosestHit";
+        dxil_lib_exports[2].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[2].ExportToRename = nullptr;
+        dxil_lib_exports[2].Name           = L"Miss";
+
+        D3D12_DXIL_LIBRARY_DESC dxil_lib_desc{};
+        dxil_lib_desc.DXILLibrary.pShaderBytecode = dxil_library->GetBufferPointer();
+        dxil_lib_desc.DXILLibrary.BytecodeLength  = dxil_library->GetBufferSize();
+        dxil_lib_desc.NumExports                  = 3;
+        dxil_lib_desc.pExports                    = dxil_lib_exports;
+
+        D3D12_STATE_SUBOBJECT subobj_dxil_lib{};
+        subobj_dxil_lib.Type  = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+        subobj_dxil_lib.pDesc = &dxil_lib_desc;
+        subobjects.push_back(subobj_dxil_lib);
+
+        // 2. Shader Config
+        D3D12_RAYTRACING_SHADER_CONFIG shader_config{};
+        shader_config.MaxAttributeSizeInBytes = 8;   // float2 bary
+        shader_config.MaxPayloadSizeInBytes   = 32;  // float4 color, int recursionDepth, float3 normal
+        D3D12_STATE_SUBOBJECT subobj_shaderconfig{};
+        subobj_shaderconfig.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+        subobj_shaderconfig.pDesc = &shader_config;
+        subobjects.push_back(subobj_shaderconfig);
+
+        // 3. Global Root Signature
+        D3D12_STATE_SUBOBJECT subobj_global_rootsig{};
+        subobj_global_rootsig.Type  = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+        subobj_global_rootsig.pDesc = &g_global_rootsig;
+        subobjects.push_back(subobj_global_rootsig);
+
+        // 4. Pipeline config
+        D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config{};
+        pipeline_config.MaxTraceRecursionDepth = 1;
+        D3D12_STATE_SUBOBJECT subobj_pipeline_config{};
+        subobj_pipeline_config.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+        subobj_pipeline_config.pDesc = &pipeline_config;
+        subobjects.push_back(subobj_pipeline_config);
+
+        // 5. Hit Group
+        D3D12_HIT_GROUP_DESC hitgroup_desc{};
+        hitgroup_desc.HitGroupExport           = L"HitGroup";
+        hitgroup_desc.ClosestHitShaderImport   = L"ClosestHit";
+        hitgroup_desc.AnyHitShaderImport       = nullptr;
+        hitgroup_desc.IntersectionShaderImport = nullptr;
+        D3D12_STATE_SUBOBJECT subobj_hitgroup  = {};
+        subobj_hitgroup.Type                   = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+        subobj_hitgroup.pDesc                  = &hitgroup_desc;
+        subobjects.push_back(subobj_hitgroup);
+
+        D3D12_STATE_OBJECT_DESC rtpso_desc{};
+        rtpso_desc.Type          = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+        rtpso_desc.NumSubobjects = int(subobjects.size());
+        rtpso_desc.pSubobjects   = subobjects.data();
+        CE(g_device12->CreateStateObject(&rtpso_desc, IID_PPV_ARGS(&g_rt_state_object_ao)));
+
+        g_rt_state_object_ao->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props_ao));
     }
 
     // CB and CBV
@@ -540,6 +630,7 @@ int RoundUp(int x, int align)
 
 void CreateShaderBindingTable()
 {
+    // Primay ray's SBT
     void* raygen_shader_id = g_rt_state_object_props->GetShaderIdentifier(L"RayGen");
     void* hitgroup_id      = g_rt_state_object_props->GetShaderIdentifier(L"HitGroup");
     void* miss_shader_id   = g_rt_state_object_props->GetShaderIdentifier(L"Miss");
@@ -584,6 +675,29 @@ void CreateShaderBindingTable()
     g_miss_sbt_storage->Map(0, nullptr, (void**)&mapped);
     memcpy(mapped, miss_shader_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
     g_miss_sbt_storage->Unmap(0, nullptr);
+
+    // AO ray's SBT
+    raygen_shader_id = g_rt_state_object_props_ao->GetShaderIdentifier(L"RayGen");
+    hitgroup_id      = g_rt_state_object_props_ao->GetShaderIdentifier(L"HitGroup");
+    miss_shader_id   = g_rt_state_object_props_ao->GetShaderIdentifier(L"Miss");
+    sbt_desc.Width   = 64;
+    CE(g_device12->CreateCommittedResource(
+        &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_raygen_sbt_storage_ao)));
+    g_raygen_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
+    memcpy(mapped, raygen_shader_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    g_raygen_sbt_storage_ao->Unmap(0, nullptr);
+
+    CE(g_device12->CreateCommittedResource(
+        &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_hit_sbt_storage_ao)));
+    g_hit_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
+    memcpy(mapped, hitgroup_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    g_hit_sbt_storage_ao->Unmap(0, nullptr);
+
+    CE(g_device12->CreateCommittedResource(
+        &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_miss_sbt_storage_ao)));
+    g_miss_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
+    memcpy(mapped, miss_shader_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    g_miss_sbt_storage_ao->Unmap(0, nullptr);
 }
 
 void Render()
@@ -615,21 +729,37 @@ void Render()
         g_command_list->ResourceBarrier(1, &barrier_rt_out);
         // Dispath ray
         g_command_list->SetComputeRootSignature(g_global_rootsig);
-        g_command_list->SetPipelineState1(g_rt_state_object);
         D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
         g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
         g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
 
         D3D12_DISPATCH_RAYS_DESC desc{};
-        desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
-        desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-        desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
-        desc.MissShaderTable.SizeInBytes            = 64;
-        desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
-        desc.HitGroupTable.SizeInBytes              = 64;
-        desc.Width                                  = WIN_W;
-        desc.Height                                 = WIN_H;
-        desc.Depth                                  = 1;
+        if (g_use_ao == false)
+        {
+            g_command_list->SetPipelineState1(g_rt_state_object);
+            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
+            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
+            desc.MissShaderTable.SizeInBytes            = 64;
+            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
+            desc.HitGroupTable.SizeInBytes              = 64;
+            desc.Width                                  = WIN_W;
+            desc.Height                                 = WIN_H;
+            desc.Depth                                  = 1;
+        }
+        else
+        {
+            g_command_list->SetPipelineState1(g_rt_state_object_ao);
+            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
+            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
+            desc.MissShaderTable.SizeInBytes            = 64;
+            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress();
+            desc.HitGroupTable.SizeInBytes              = 64;
+            desc.Width                                  = WIN_W;
+            desc.Height                                 = WIN_H;
+            desc.Depth                                  = 1;
+        }
 
         g_command_list->DispatchRays(&desc);
 
@@ -1222,8 +1352,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                         RraBlasGetSurfaceArea(i, ch, &sa);
                         if (sa <= 0)
                         {
-                            printf("BLAS[%u]'s node %08X's surface area is zero. Skipping.\n", i, ch);
-                            continue;
+                            printf("BLAS[%u]'s node %08X's surface area is zero\n", i, ch);
                         }
 
                         uint32_t tc{};
