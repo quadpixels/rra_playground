@@ -10,14 +10,6 @@ struct HitInfo
     float4 colorAndDistance;
 };
 
-cbuffer RayGenCB : register(b0)
-{
-    float4x4 inverse_view;
-    float4x4 inverse_proj;
-    bool invert_y;
-};
-
-
 [shader("raygeneration")]
 void RayGen()
 {

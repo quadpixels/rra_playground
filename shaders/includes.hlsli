@@ -4,6 +4,13 @@ StructuredBuffer<int> InstanceVertOffsets : register(t2);
 
 RWTexture2D<float4> RenderTarget : register(u0);
 
+cbuffer RayGenCB : register(b0)
+{
+    float4x4 inverse_view;
+    float4x4 inverse_proj;
+    bool invert_y;
+    int ao_samples;
+};
 
 float3 TransformPosition(float4x4 m, float3 x)
 {

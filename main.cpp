@@ -37,6 +37,43 @@
 #undef min
 #undef max
 
+struct FrameTime
+{
+    std::vector<float> samples;  // elapsed, frame_time
+    float                                last_secs{0};
+    float                                curr_frametime{0};
+    float                                update_interval = 0.75f; // seconds
+
+    float GetFrameTime()
+    {
+        float curr_secs = glfwGetTime();
+        if (curr_secs - last_secs > update_interval)
+        {
+            float sum = 0;
+            for (float s : samples)
+            {
+                sum += s;
+            }
+            curr_frametime = sum * 1.0f / int(samples.size());
+            samples.clear();
+            last_secs = curr_secs;
+        }
+        return curr_frametime;
+    }
+
+    void AddSample(float x)
+    {
+        samples.push_back(x);
+    }
+
+    bool ShouldUpdate()
+    {
+        return (glfwGetTime() - last_secs > update_interval);
+    }
+};
+
+FrameTime g_frame_time;
+
 struct CamParams
 {
     glm::vec3 eye, center, up;
@@ -47,7 +84,9 @@ std::map<std::string, CamParams> CAM_PARAMS = {
     {"SolarBay", {glm::vec3(5.964f, 1.691f, 5.374f), glm::vec3(2.921f, 1.691f, 2.120f), glm::vec3(0, 1, 0), false}},
     {"PortRoyal", {glm::vec3(-7.2252469f, 0.8361527f, 25.2023430f), glm::vec3(-6.8860960f, 0.8613553f, 24.2284565f), glm::vec3(0, 1, 0), true}},
     {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
-    {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}}};
+    {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
+    {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}}
+};
 
 struct Vertex
 {
@@ -63,13 +102,14 @@ struct RayGenCB
     DirectX::XMMATRIX inverse_view;
     DirectX::XMMATRIX inverse_proj;
     bool              invert_y;
+    int               ao_samples;
 };
 
 int WIN_W = 1280, WIN_H = 720;
 constexpr const int FRAME_COUNT = 2;
 
 GLFWwindow*      g_window;
-bool             g_use_debug_layer{false};
+bool             g_use_debug_layer{true};
 ID3D12Device5*   g_device12;
 IDXGIFactory4*   g_factory;
 IDXGISwapChain3* g_swapchain;
@@ -83,8 +123,13 @@ ID3D12GraphicsCommandList4* g_command_list1;  // For building AS
 ID3D12RootSignature*         g_global_rootsig{};
 ID3D12StateObject*           g_rt_state_object;
 ID3D12StateObjectProperties* g_rt_state_object_props;
+ID3D12RootSignature*         g_global_rootsig_ao{};
 ID3D12StateObject*           g_rt_state_object_ao;
 ID3D12StateObjectProperties* g_rt_state_object_props_ao;
+
+glm::mat4 g_inv_view;
+glm::mat4 g_inv_proj;
+bool      g_invert_y = false;
 
 ID3D12DescriptorHeap* g_rtv_heap;
 ID3D12DescriptorHeap* g_srv_uav_cbv_heap;
@@ -99,9 +144,14 @@ ID3D12Resource* g_raygen_sbt_storage;
 ID3D12Resource* g_hit_sbt_storage;
 ID3D12Resource* g_miss_sbt_storage;
 
+ID3D12Resource* g_hitpos_ao;
 ID3D12Resource* g_raygen_sbt_storage_ao;
 ID3D12Resource* g_hit_sbt_storage_ao;
 ID3D12Resource* g_miss_sbt_storage_ao;
+int             g_ao_sample_count{1};
+
+ID3D12QueryHeap* g_query_heap;
+ID3D12Resource*  g_query_readback_buffer;
 
 bool g_use_ao{false};
 
@@ -177,7 +227,8 @@ IDxcBlob* CompileShaderLibrary(LPCWSTR fileName)
 
     // Compile
     IDxcOperationResult* pResult;
-    CE(pCompiler->Compile(pTextBlob, fileName, L"", L"lib_6_5", nullptr, 0, nullptr, 0, dxcIncludeHandler, &pResult));
+    const wchar_t*       args[] = { L"-O3" };
+    CE(pCompiler->Compile(pTextBlob, fileName, L"", L"lib_6_5", args, 1, nullptr, 0, dxcIncludeHandler, &pResult));
 
     // Verify the result
     HRESULT resultCode;
@@ -227,6 +278,19 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             g_use_ao = !g_use_ao;
             break;
+        }
+        case GLFW_KEY_UP:
+        {
+            g_ao_sample_count++;
+            if (g_ao_sample_count > 32)
+                g_ao_sample_count = 32;
+            break;
+        }
+        case GLFW_KEY_DOWN:
+        {
+            g_ao_sample_count--;
+            if (g_ao_sample_count < 0)
+                g_ao_sample_count = 0;
         }
         default:
             break;
@@ -377,20 +441,55 @@ void InitDX12Stuff()
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rt_output_resource)));
     g_rt_output_resource->SetName(L"RT output resource");
 
+    // Hit position in world space
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Format    = DXGI_FORMAT_UNKNOWN;
+    desc.Width     = WIN_W * WIN_H * sizeof(float) * 4;
+    desc.Height    = 1;
+    desc.Layout    = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    CE(g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_hitpos_ao)));
+    g_hitpos_ao->SetName(L"Hit position");
+
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 5;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets
+    heap_desc.NumDescriptors = 6;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
     g_srv_uav_cbv_heap->SetName(L"SRV UAV CBV heap");
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    // Query heap
+    D3D12_QUERY_HEAP_DESC qhd{};
+    qhd.Count = 2;
+    qhd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qhd.NodeMask = 0;
+    CE(g_device12->CreateQueryHeap(&qhd, IID_PPV_ARGS(&g_query_heap)));
+
+    // Query read-back resource
+    props.Type     = D3D12_HEAP_TYPE_READBACK;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Format    = DXGI_FORMAT_UNKNOWN;
+    desc.Width     = sizeof(uint64_t) * 2;
+    desc.Flags     = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_query_readback_buffer)));
+
     // UAV
     D3D12_CPU_DESCRIPTOR_HANDLE      handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
     uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_device12->CreateUnorderedAccessView(g_rt_output_resource, nullptr, &uav_desc, handle);
+
+    handle.ptr += 5 * g_srv_uav_cbv_descriptor_size;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.CounterOffsetInBytes = 0;
+    uav_desc.Buffer.FirstElement         = 0;
+    uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_NONE;
+    uav_desc.Buffer.NumElements          = WIN_W * WIN_H;
+    uav_desc.Buffer.StructureByteStride  = sizeof(float) * 4;
+    g_device12->CreateUnorderedAccessView(g_hitpos_ao, nullptr, &uav_desc, handle);
 }
 
 void CreateRTPipeline()
@@ -400,7 +499,7 @@ void CreateRTPipeline()
         D3D12_ROOT_PARAMETER root_params[1];
         root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 
-        D3D12_DESCRIPTOR_RANGE desc_ranges[4]{};
+        D3D12_DESCRIPTOR_RANGE desc_ranges[5]{};
         desc_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Output0
         desc_ranges[0].NumDescriptors                    = 1;
         desc_ranges[0].BaseShaderRegister                = 0;
@@ -442,6 +541,23 @@ void CreateRTPipeline()
             printf("Error: %s\n", (char*)(error->GetBufferPointer()));
         }
         CE(g_device12->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_global_rootsig)));
+        signature->Release();
+        if (error)
+            error->Release();
+
+        desc_ranges[4].RangeType      = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Hit position
+        desc_ranges[4].NumDescriptors = 1;
+        desc_ranges[4].BaseShaderRegister = 1;
+        desc_ranges[4].RegisterSpace      = 0;
+        desc_ranges[4].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        root_params[0].DescriptorTable.NumDescriptorRanges = 5;
+
+        D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+        if (error)
+        {
+            printf("Error: %s\n", (char*)(error->GetBufferPointer()));
+        }
+        CE(g_device12->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_global_rootsig_ao)));
         signature->Release();
         if (error)
             error->Release();
@@ -526,21 +642,30 @@ void CreateRTPipeline()
 
         // 1. DXIL Library
         IDxcBlob*         dxil_library = CompileShaderLibrary(L"shaders/aoray.hlsl");
-        D3D12_EXPORT_DESC dxil_lib_exports[3];
+        D3D12_EXPORT_DESC dxil_lib_exports[6];
         dxil_lib_exports[0].Flags          = D3D12_EXPORT_FLAG_NONE;
         dxil_lib_exports[0].ExportToRename = nullptr;
-        dxil_lib_exports[0].Name           = L"RayGen";
+        dxil_lib_exports[0].Name           = L"RayGen_primary";
         dxil_lib_exports[1].Flags          = D3D12_EXPORT_FLAG_NONE;
         dxil_lib_exports[1].ExportToRename = nullptr;
-        dxil_lib_exports[1].Name           = L"ClosestHit";
+        dxil_lib_exports[1].Name           = L"ClosestHit_primary";
         dxil_lib_exports[2].Flags          = D3D12_EXPORT_FLAG_NONE;
         dxil_lib_exports[2].ExportToRename = nullptr;
-        dxil_lib_exports[2].Name           = L"Miss";
+        dxil_lib_exports[2].Name           = L"Miss_primary";
+        dxil_lib_exports[3].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[3].ExportToRename = nullptr;
+        dxil_lib_exports[3].Name           = L"RayGen_ao";
+        dxil_lib_exports[4].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[4].ExportToRename = nullptr;
+        dxil_lib_exports[4].Name           = L"ClosestHit_ao";
+        dxil_lib_exports[5].Flags          = D3D12_EXPORT_FLAG_NONE;
+        dxil_lib_exports[5].ExportToRename = nullptr;
+        dxil_lib_exports[5].Name           = L"Miss_ao";
 
         D3D12_DXIL_LIBRARY_DESC dxil_lib_desc{};
         dxil_lib_desc.DXILLibrary.pShaderBytecode = dxil_library->GetBufferPointer();
         dxil_lib_desc.DXILLibrary.BytecodeLength  = dxil_library->GetBufferSize();
-        dxil_lib_desc.NumExports                  = 3;
+        dxil_lib_desc.NumExports                  = 6;
         dxil_lib_desc.pExports                    = dxil_lib_exports;
 
         D3D12_STATE_SUBOBJECT subobj_dxil_lib{};
@@ -551,7 +676,7 @@ void CreateRTPipeline()
         // 2. Shader Config
         D3D12_RAYTRACING_SHADER_CONFIG shader_config{};
         shader_config.MaxAttributeSizeInBytes = 8;   // float2 bary
-        shader_config.MaxPayloadSizeInBytes   = 32;  // float4 color, int recursionDepth, float3 normal
+        shader_config.MaxPayloadSizeInBytes   = 4;  // float4 color, int recursionDepth, float3 normal
         D3D12_STATE_SUBOBJECT subobj_shaderconfig{};
         subobj_shaderconfig.Type  = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
         subobj_shaderconfig.pDesc = &shader_config;
@@ -560,7 +685,7 @@ void CreateRTPipeline()
         // 3. Global Root Signature
         D3D12_STATE_SUBOBJECT subobj_global_rootsig{};
         subobj_global_rootsig.Type  = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
-        subobj_global_rootsig.pDesc = &g_global_rootsig;
+        subobj_global_rootsig.pDesc = &g_global_rootsig_ao;
         subobjects.push_back(subobj_global_rootsig);
 
         // 4. Pipeline config
@@ -571,16 +696,27 @@ void CreateRTPipeline()
         subobj_pipeline_config.pDesc = &pipeline_config;
         subobjects.push_back(subobj_pipeline_config);
 
-        // 5. Hit Group
+        // 5. Hit Group for primary
         D3D12_HIT_GROUP_DESC hitgroup_desc{};
-        hitgroup_desc.HitGroupExport           = L"HitGroup";
-        hitgroup_desc.ClosestHitShaderImport   = L"ClosestHit";
+        hitgroup_desc.HitGroupExport           = L"HitGroup_primary";
+        hitgroup_desc.ClosestHitShaderImport   = L"ClosestHit_primary";
         hitgroup_desc.AnyHitShaderImport       = nullptr;
         hitgroup_desc.IntersectionShaderImport = nullptr;
         D3D12_STATE_SUBOBJECT subobj_hitgroup  = {};
         subobj_hitgroup.Type                   = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
         subobj_hitgroup.pDesc                  = &hitgroup_desc;
         subobjects.push_back(subobj_hitgroup);
+
+        // 6. Hit Group for ao
+        D3D12_HIT_GROUP_DESC hitgroup_desc_ao{};
+        hitgroup_desc_ao.HitGroupExport           = L"HitGroup_ao";
+        hitgroup_desc_ao.ClosestHitShaderImport   = L"ClosestHit_ao";
+        hitgroup_desc_ao.AnyHitShaderImport       = nullptr;
+        hitgroup_desc_ao.IntersectionShaderImport = nullptr;
+        D3D12_STATE_SUBOBJECT subobj_hitgroup_ao     = {};
+        subobj_hitgroup_ao.Type                      = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+        subobj_hitgroup_ao.pDesc                     = &hitgroup_desc_ao;
+        subobjects.push_back(subobj_hitgroup_ao);
 
         D3D12_STATE_OBJECT_DESC rtpso_desc{};
         rtpso_desc.Type          = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
@@ -677,31 +813,50 @@ void CreateShaderBindingTable()
     g_miss_sbt_storage->Unmap(0, nullptr);
 
     // AO ray's SBT
-    raygen_shader_id = g_rt_state_object_props_ao->GetShaderIdentifier(L"RayGen");
-    hitgroup_id      = g_rt_state_object_props_ao->GetShaderIdentifier(L"HitGroup");
-    miss_shader_id   = g_rt_state_object_props_ao->GetShaderIdentifier(L"Miss");
-    sbt_desc.Width   = 64;
+    raygen_shader_id = g_rt_state_object_props_ao->GetShaderIdentifier(L"RayGen_primary");
+    hitgroup_id      = g_rt_state_object_props_ao->GetShaderIdentifier(L"HitGroup_primary");
+    miss_shader_id   = g_rt_state_object_props_ao->GetShaderIdentifier(L"Miss_primary");
+    void* raygen_shader_id_ao = g_rt_state_object_props_ao->GetShaderIdentifier(L"RayGen_ao");
+    void* hitgroup_id_ao      = g_rt_state_object_props_ao->GetShaderIdentifier(L"HitGroup_ao");
+    void* miss_shader_id_ao   = g_rt_state_object_props_ao->GetShaderIdentifier(L"Miss_ao");
+
+    sbt_desc.Width   = 128;
     CE(g_device12->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_raygen_sbt_storage_ao)));
     g_raygen_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
     memcpy(mapped, raygen_shader_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    memcpy(mapped + 64, raygen_shader_id_ao, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
     g_raygen_sbt_storage_ao->Unmap(0, nullptr);
 
     CE(g_device12->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_hit_sbt_storage_ao)));
     g_hit_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
     memcpy(mapped, hitgroup_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    memcpy(mapped + 64, hitgroup_id_ao, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
     g_hit_sbt_storage_ao->Unmap(0, nullptr);
 
     CE(g_device12->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &sbt_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_miss_sbt_storage_ao)));
     g_miss_sbt_storage_ao->Map(0, nullptr, (void**)&mapped);
     memcpy(mapped, miss_shader_id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    memcpy(mapped + 64, miss_shader_id_ao, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
     g_miss_sbt_storage_ao->Unmap(0, nullptr);
 }
 
 void Render()
 {
+    // Update
+    char* mapped;
+    g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
+    RayGenCB cb{};
+    GlmMat4ToDirectXMatrix(&cb.inverse_view, g_inv_view);
+    GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
+    cb.invert_y   = g_invert_y;
+    cb.ao_samples = g_ao_sample_count;
+    memcpy(mapped, &cb, sizeof(RayGenCB));
+    g_raygen_cb->Unmap(0, nullptr);
+
+    // Render
     D3D12_CPU_DESCRIPTOR_HANDLE handle_rtv(g_rtv_heap->GetCPUDescriptorHandleForHeapStart());
     handle_rtv.ptr += g_rtv_descriptor_size * g_frame_index;
 
@@ -727,15 +882,18 @@ void Render()
         barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         g_command_list->ResourceBarrier(1, &barrier_rt_out);
-        // Dispath ray
-        g_command_list->SetComputeRootSignature(g_global_rootsig);
+
+        g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+        // Dispatch ray
         D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
-        g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
-        g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
 
         D3D12_DISPATCH_RAYS_DESC desc{};
         if (g_use_ao == false)
         {
+            g_command_list->SetComputeRootSignature(g_global_rootsig);
+            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
+            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
             g_command_list->SetPipelineState1(g_rt_state_object);
             desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
             desc.RayGenerationShaderRecord.SizeInBytes  = 64;
@@ -746,10 +904,23 @@ void Render()
             desc.Width                                  = WIN_W;
             desc.Height                                 = WIN_H;
             desc.Depth                                  = 1;
+            g_command_list->DispatchRays(&desc);
         }
         else
         {
+            g_command_list->SetComputeRootSignature(g_global_rootsig_ao);
+            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
+            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
             g_command_list->SetPipelineState1(g_rt_state_object_ao);
+
+            D3D12_RESOURCE_BARRIER hitpos_barrier{};
+            hitpos_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            hitpos_barrier.Transition.pResource = g_hitpos_ao;
+            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            g_command_list->ResourceBarrier(1, &hitpos_barrier);
+
+            // Primary Rays
             desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
             desc.RayGenerationShaderRecord.SizeInBytes  = 64;
             desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
@@ -759,9 +930,32 @@ void Render()
             desc.Width                                  = WIN_W;
             desc.Height                                 = WIN_H;
             desc.Depth                                  = 1;
+            g_command_list->DispatchRays(&desc);
+
+            D3D12_RESOURCE_BARRIER uav_barrier{};
+            uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav_barrier.UAV.pResource = g_hitpos_ao;
+            g_command_list->ResourceBarrier(1, &uav_barrier);
+
+            // AO Rays
+            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+            desc.MissShaderTable.SizeInBytes            = 64;
+            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+            desc.HitGroupTable.SizeInBytes              = 64;
+            desc.Width                                  = WIN_W;
+            desc.Height                                 = WIN_H;
+            desc.Depth                                  = 1;
+            g_command_list->DispatchRays(&desc);
+
+            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+            g_command_list->ResourceBarrier(1, &hitpos_barrier);
         }
 
-        g_command_list->DispatchRays(&desc);
+        g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        g_command_list->ResolveQueryData(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g_query_readback_buffer, 0);
 
         barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -789,6 +983,40 @@ void Render()
     CE(g_swapchain->Present(1, 0));
     WaitForPreviousFrame();
     CE(g_command_allocator->Reset());
+
+    // Read timer
+    uint64_t freq{0};
+    g_command_queue->GetTimestampFrequency(&freq);
+
+    uint64_t timestamps[2];
+    g_query_readback_buffer->Map(0, nullptr, (void**)(&mapped));
+    memcpy(timestamps, mapped, 2 * sizeof(uint64_t));
+    g_query_readback_buffer->Unmap(0, nullptr);
+    float sec = (timestamps[1] - timestamps[0]) * 1.0f / freq;
+
+    g_frame_time.AddSample(sec);
+    if (g_frame_time.ShouldUpdate())
+    {
+        std::stringstream ss;
+        ss << "MyRRAPlayground ";
+        if (!g_as_built)
+        {
+            ss << "Building AS ...";
+        }
+        else
+        {
+            ss << std::setprecision(4) << (g_frame_time.GetFrameTime() * 1000) << "ms/frame";
+            if (g_use_ao)
+            {
+                ss << " AO rays, " << g_ao_sample_count << " samples";
+            }
+            else
+            {
+                ss << " primary ray";
+            }
+        }
+        glfwSetWindowTitle(g_window, ss.str().c_str());
+    }
 }
 
 void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vector<InstanceInfo>& inst_infos)
@@ -870,7 +1098,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
         inputs.NumDescs       = 1;
         inputs.pGeometryDescs = &geom_desc;
-        inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+        inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pb_info{};
         g_device12->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &pb_info);
@@ -917,7 +1145,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         build_desc.DestAccelerationStructureData    = blas_result->GetGPUVirtualAddress();
         build_desc.ScratchAccelerationStructureData = blas_scratch->GetGPUVirtualAddress();
         build_desc.SourceAccelerationStructureData  = 0;
-        build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+        build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
         // Build BLAS
         g_command_list1->Reset(g_command_allocator1, nullptr);
@@ -1017,7 +1245,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     tlas_inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     tlas_inputs.NumDescs       = instance_descs.size();
     tlas_inputs.pGeometryDescs = nullptr;
-    tlas_inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+    tlas_inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pb_info{};
     g_device12->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_inputs, &pb_info);
@@ -1059,7 +1287,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     tlas_build_desc.DestAccelerationStructureData    = tlas_result->GetGPUVirtualAddress();
     tlas_build_desc.ScratchAccelerationStructureData = tlas_scratch->GetGPUVirtualAddress();
     tlas_build_desc.SourceAccelerationStructureData  = 0;
-    tlas_build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+    tlas_build_desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
 
     // Build BLAS
     g_command_list1->Reset(g_command_allocator1, nullptr);
@@ -1213,15 +1441,16 @@ void LoadCubeAndCreateAS()
     glm::mat4 view = glm::lookAt(eye, center, up);
     glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
 
-    glm::mat4 inv_view = glm::inverse(view);
-    glm::mat4 inv_proj = glm::inverse(proj);
+    g_inv_view = glm::inverse(view);
+    g_inv_proj = glm::inverse(proj);
 
     char* mapped{};
     g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
     RayGenCB cb{};
-    GlmMat4ToDirectXMatrix(&cb.inverse_view, inv_view);
-    GlmMat4ToDirectXMatrix(&cb.inverse_proj, inv_proj);
-    cb.invert_y = false;
+    GlmMat4ToDirectXMatrix(&cb.inverse_view, g_inv_view);
+    GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
+    cb.invert_y = g_invert_y;
+    cb.ao_samples = g_ao_sample_count;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 }
@@ -1480,7 +1709,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     glm::vec3 eye(0, 0, 0);
     glm::vec3 center(0, 1, 0);
     glm::vec3 up(0, 1, 0);
-    bool      invert_y = false;
+    g_invert_y = false;
 
     std::string fn(g_rra_file_name);
     for (const auto& entry : CAM_PARAMS)
@@ -1491,22 +1720,23 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
             eye      = entry.second.eye;
             center   = entry.second.center;
             up       = entry.second.up;
-            invert_y = entry.second.invert_y;
+            g_invert_y = entry.second.invert_y;
         }
     }
 
     glm::mat4 view = glm::lookAt(eye, center, up);
     glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
 
-    glm::mat4 inv_view = glm::inverse(view);
-    glm::mat4 inv_proj = glm::inverse(proj);
+    g_inv_view = glm::inverse(view);
+    g_inv_proj = glm::inverse(proj);
 
     char* mapped{};
     g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
     RayGenCB cb{};
-    GlmMat4ToDirectXMatrix(&cb.inverse_view, inv_view);
-    GlmMat4ToDirectXMatrix(&cb.inverse_proj, inv_proj);
-    cb.invert_y = invert_y;
+    GlmMat4ToDirectXMatrix(&cb.inverse_view, g_inv_view);
+    GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
+    cb.invert_y = g_invert_y;
+    cb.ao_samples = g_ao_sample_count;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 }
