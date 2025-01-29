@@ -86,8 +86,8 @@ std::map<std::string, CamParams> CAM_PARAMS = {
     {"PortRoyal", {glm::vec3(-7.2252469f, 0.8361527f, 25.2023430f), glm::vec3(-6.8860960f, 0.8613553f, 24.2284565f), glm::vec3(0, 1, 0), true}},
     {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
     {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
-    {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}}
-};
+    {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
+    {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}}};
 
 struct Vertex
 {
