@@ -1,6 +1,8 @@
 #include "includes.hlsli"
 
 RWStructuredBuffer<float4> HitNormalAndT : register(u1);
+RWStructuredBuffer<int> RayMapping : register(u2);
+RWStructuredBuffer<float3> RayDirs : register(u3);
 
 struct Attributes
 {
@@ -78,23 +80,44 @@ void RayGen_ao()
     RayDesc ray;
     
     float3 origin = TransformPosition(inverse_view, float3(0, 0, 0));
-    float2 d = (((DispatchRaysIndex().xy + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
+    float2 d;
+    float3 n;
+    float t;
+    if (use_ray_binning)
+    {
+        int outidx = RayMapping[idx];
+        int2 rtidx = { outidx % DispatchRaysDimensions().r, outidx / DispatchRaysDimensions().r };
+        d = (((rtidx + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
+        n = HitNormalAndT[outidx].xyz;
+        t = HitNormalAndT[outidx].w;
+    }
+    else
+    {
+        d = (((DispatchRaysIndex().xy + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
+        n = HitNormalAndT[idx].xyz;
+        t = HitNormalAndT[idx].w;
+    }
     if (invert_y)
         d.y *= -1;
     float3 target = TransformPosition(inverse_proj, float3(d.x, -d.y, 1));
     float3 dir = TransformDirection(inverse_view, normalize(target));
     
-    float3 n = HitNormalAndT[idx].xyz;
-    
-    ray.Origin = origin + dir * HitNormalAndT[idx].w;
+    ray.Origin = origin + dir * t;
     ray.TMin = 0.001;
-    ray.TMax = 10000.0;
+    ray.TMax = ao_radius;
 
     int ao = 0;
     for (int i = 0; i < ao_samples; i++)
     {
-        int seed = tea(DispatchRaysIndex().x + DispatchRaysIndex().y * DispatchRaysDimensions().r, i, 16).x;
-        ray.Direction = SampleHemisphereCosine(n, seed);
+        if (use_ray_binning == 0)
+        {
+            int seed = tea(DispatchRaysIndex().x + DispatchRaysIndex().y * DispatchRaysDimensions().r, i, 16).x;
+            ray.Direction = SampleHemisphereCosine(n, seed);
+        }
+        else
+        {
+            ray.Direction = RayDirs[idx];
+        }
         HitInfo_primary payload = { -1 };
         TraceRay(Scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, 0, 0, 0, ray, payload);
         if (payload.tHit > 0)
@@ -107,7 +130,17 @@ void RayGen_ao()
     float4 ret;
     ret.xyz = /*ret.xyz*/float3(1, 1, 1) * ao_occ;
     ret.w = 1;
-    RenderTarget[DispatchRaysIndex().xy] = ret;
+    
+    if (use_ray_binning > 0)
+    {
+        int outidx = RayMapping[idx];
+        int2 rtidx = { outidx % DispatchRaysDimensions().r, outidx / DispatchRaysDimensions().r };
+        RenderTarget[rtidx] = ret;
+    }
+    else
+    {
+        RenderTarget[DispatchRaysIndex().xy] = ret;
+    }
 }
 
 [shader("miss")]

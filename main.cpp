@@ -103,14 +103,18 @@ struct RayGenCB
     DirectX::XMMATRIX inverse_view;
     DirectX::XMMATRIX inverse_proj;
     bool              invert_y;
+    int               use_ray_binning;
     int               ao_samples;
+    float             ao_radius;
 };
 
 int WIN_W = 1280, WIN_H = 720;
 constexpr const int FRAME_COUNT = 2;
 
+int RT_W = 1280, RT_H = 720;  // Off-screen RT rendering width and height
+
 GLFWwindow*      g_window;
-bool             g_use_debug_layer{true};
+bool             g_use_debug_layer{false};
 ID3D12Device5*   g_device12;
 IDXGIFactory4*   g_factory;
 IDXGISwapChain3* g_swapchain;
@@ -153,15 +157,22 @@ ID3D12Resource* g_hit_sbt_storage;
 ID3D12Resource* g_miss_sbt_storage;
 
 ID3D12Resource* g_hitpos_ao;
+ID3D12Resource* g_hitpos_ao_readback;
+ID3D12Resource* g_ray_mapping, *g_ray_mapping_upload;  // For ray-binning experiments
+ID3D12Resource* g_aoray_dirs, *g_aoray_dirs_upload;   // For ray-binning experiments
 ID3D12Resource* g_raygen_sbt_storage_ao;
 ID3D12Resource* g_hit_sbt_storage_ao;
 ID3D12Resource* g_miss_sbt_storage_ao;
 int             g_ao_sample_count{1};
+bool            g_force_hitpos_dirty{false};
+bool            g_hitpos_dirty{true};
 
 ID3D12QueryHeap* g_query_heap;
 ID3D12Resource*  g_query_readback_buffer;
 
 bool g_use_ao{false};
+int g_use_ray_binning{0};
+bool g_ray_mapping_dirty{true};
 
 ID3D12Fence* g_fence;
 int          g_fence_value;
@@ -171,6 +182,113 @@ int          g_frame_index;
 const char* g_rra_file_name;
 
 std::atomic<bool> g_as_built{false};
+
+glm::vec3 g_scene_aabb_min{1e20, 1e20, 1e20}, g_scene_aabb_max{-1e20, -1e20, -1e20};
+float     g_ao_radius{10000};
+glm::vec3 g_cam_pos{};
+
+enum BenchmarkState
+{
+    NOT_STARTED,
+    BENCHMARKING,
+};
+BenchmarkState g_benchmarkState{NOT_STARTED};
+int g_bmk_ft_count      = 0;
+std::vector<float> g_bmk_frametimes;
+const int          BMK_AO_SAMPLE_COUNT_LIMIT = 32;
+
+static glm::vec3 Constrain(glm::vec3 x)
+{
+    x.x = std::max(0.0f, std::min(1.0f, x.x));
+    x.y = std::max(0.0f, std::min(1.0f, x.y));
+    x.z = std::max(0.0f, std::min(1.0f, x.z));
+    return x;
+}
+
+static glm::vec3 TransformPosition(const glm::mat4& m, const glm::vec3& x)
+{
+    glm::vec4 x4(x, 0.0f);
+    x4 = m * x4;
+    x4.x += m[3][0];
+    x4.y += m[3][1];
+    x4.z += m[3][2];
+    return glm::vec3(x4);
+}
+
+static glm::vec3 TransformDirection(const glm::mat4& m, const glm::vec3& x)
+{
+    glm::vec4 x4(x, 0.0f);
+    x4 = m * x4;
+    return glm::vec3(x4);
+}
+
+static glm::vec2 OctWrap(const glm::vec2& v)
+{
+    glm::vec2 ret(1.0f, 1.0f);
+    ret -= glm::vec2(abs(v.y), abs(v.x));
+    ret.x *= (v.x >= 0 ? 1 : -1);
+    ret.y *= (v.y >= 0 ? 1 : -1);
+    return ret;
+}
+
+static glm::vec2 OctEncode(glm::vec3 n)
+{
+    n = glm::normalize(n);
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.z < 0)
+    {
+        glm::vec2 xy = OctWrap(glm::vec2(n.x, n.y));
+        n.x        = xy.x;
+        n.y        = xy.y;
+    }
+    n.x = n.x * 0.5 + 0.5;
+    n.y = n.y * 0.5 + 0.5;
+    return glm::vec2(n.x, n.y);
+}
+
+glm::uvec2 TEA(unsigned int val0, unsigned int val1, unsigned int N)
+{
+    unsigned int v0 = val0;
+    unsigned int v1 = val1;
+    unsigned int s0 = 0;
+
+    for (unsigned int n = 0; n < N; n++)
+    {
+        s0 += 0x9e3779b9;
+        v0 += ((v1 << 4) + 0xa341316c) ^ (v1 + s0) ^ ((v1 >> 5) + 0xc8013ea4);
+        v1 += ((v0 << 4) + 0xad90777d) ^ (v0 + s0) ^ ((v0 >> 5) + 0x7e95761e);
+    }
+
+    return glm::uvec2(v0, v1);
+}
+
+unsigned LCG(int& seed)
+{
+    const unsigned int LCG_A = 1103515245u;
+    const unsigned int LCG_C = 12345u;
+    const unsigned int LCG_M = 0x00FFFFFFu;
+    seed                     = (LCG_A * seed + LCG_C);
+    return seed & LCG_M;
+}
+
+float RandF(int& seed)
+{
+    return float(LCG(seed)) / float(0x01000000);
+}
+
+glm::vec3 SampleHemisphereCosine(glm::vec3 n, int& seed)
+{
+    float phi         = 2.0f * 3.14159 * RandF(seed);
+    float sinThetaSqr = RandF(seed);
+    float sinTheta    = sqrt(sinThetaSqr);
+
+    glm::vec3 axis = abs(n.x) > 0.001f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+    glm::vec3 t    = glm::cross(axis, n);
+    t              = normalize(t);
+    glm::vec3 s    = glm::cross(n, t);
+
+    return glm::normalize(s * cos(phi) * sinTheta + t * sin(phi) * sinTheta + n * sqrt(1.0f - sinThetaSqr));
+}
 
 void CE(HRESULT x)
 {
@@ -273,18 +391,28 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
     {
         switch (key)
         {
-        case GLFW_KEY_0:
-        {
-            break;
-        }
         case GLFW_KEY_ESCAPE:
         {
             exit(0);
             break;
         }
-        case GLFW_KEY_SPACE:
+        case GLFW_KEY_1:
         {
-            g_use_ao = !g_use_ao;
+            g_use_ao = true;
+            g_use_ray_binning = false;
+            break;
+        }
+        case GLFW_KEY_0: {
+            g_use_ao = false;
+            break;
+        }
+        case GLFW_KEY_3:
+        case GLFW_KEY_2:
+        {
+            g_ao_sample_count = 1;
+            g_use_ao          = true;
+            g_use_ray_binning = key - GLFW_KEY_0;
+            g_ray_mapping_dirty = true;
             break;
         }
         case GLFW_KEY_UP:
@@ -299,11 +427,85 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             g_ao_sample_count--;
             if (g_ao_sample_count < 0)
                 g_ao_sample_count = 0;
+            break;
+        }
+        case GLFW_KEY_B:
+        {
+            if (g_benchmarkState == BenchmarkState::NOT_STARTED)
+            {
+                g_benchmarkState = BenchmarkState::BENCHMARKING;
+                g_ao_sample_count = 0;
+                g_use_ao          = true;
+                g_bmk_ft_count    = 0;
+                g_bmk_frametimes.clear();
+            }
+            break;
+        }
+        case GLFW_KEY_D:
+        {
+            g_force_hitpos_dirty = !g_force_hitpos_dirty;
+            break;
+        }
+        case GLFW_KEY_LEFT_BRACKET:
+        {
+            g_ao_radius /= 10;
+            if (g_ao_radius <= 1)
+            {
+                g_ao_radius = 1;
+            }
+            break;
+        }
+        case GLFW_KEY_RIGHT_BRACKET:
+        {
+            g_ao_radius *= 10;
+            if (g_ao_radius >= 10000)
+            {
+                g_ao_radius = 10000;
+            }
+            break;
         }
         default:
             break;
         }
     }
+}
+
+void OnSwapchainSizeChanged()
+{
+    WaitForPreviousFrame();
+
+    for (int i = 0; i < FRAME_COUNT; i++)
+    {
+        g_rendertargets[i]->Release();
+    }
+
+    g_swapchain->ResizeBuffers(FRAME_COUNT, WIN_W, WIN_H, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (int i = 0; i < FRAME_COUNT; i++)
+    {
+        CE(g_swapchain->GetBuffer(i, IID_PPV_ARGS(&g_rendertargets[i])));
+        g_device12->CreateRenderTargetView(g_rendertargets[i], nullptr, rtv_handle);
+        rtv_handle.ptr += g_rtv_descriptor_size;
+    }
+}
+
+void WindowResizeCallback(GLFWwindow* window, int width, int height)
+{
+    if (width < 1 || height < 1) return;
+    WIN_W = width;
+    WIN_H = height;
+    OnSwapchainSizeChanged();
+    printf("Resized to %dx%d\n", width, height);
+}
+
+void WindowMaximizeCallback(GLFWwindow* window, int maximized)
+{
+    if (window != g_window)
+        return;
+    glfwGetWindowSize(window, &WIN_W, &WIN_H);
+    OnSwapchainSizeChanged();
+    printf("Maximized to %dx%d\n", WIN_W, WIN_H);
 }
 
 void CreateMyRRALoaderWindow()
@@ -325,6 +527,9 @@ void CreateMyRRALoaderWindow()
     g_window = glfwCreateWindow(WIN_W, WIN_H, "MyRraLoader", nullptr, nullptr);
 
     glfwSetKeyCallback(g_window, KeyCallback);
+    glfwSetWindowSizeCallback(g_window, WindowResizeCallback);
+    glfwSetWindowMaximizeCallback(g_window, WindowMaximizeCallback);
+    glfwSetWindowSizeLimits(g_window, 64, 64, GLFW_DONT_CARE, GLFW_DONT_CARE);
 }
 
 void InitDeviceAndCommandQ()
@@ -434,8 +639,8 @@ void InitDX12Stuff()
     desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    desc.Width            = WIN_W;
-    desc.Height           = WIN_H;
+    desc.Width            = RT_W;
+    desc.Height           = RT_H;
     desc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.MipLevels        = 1;
     desc.SampleDesc.Count = 1;
@@ -452,15 +657,40 @@ void InitDX12Stuff()
     // Hit position in world space
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Format    = DXGI_FORMAT_UNKNOWN;
-    desc.Width     = WIN_W * WIN_H * sizeof(float) * 4;
+    desc.Width     = RT_W * RT_H * sizeof(float) * 4;
     desc.Height    = 1;
     desc.Layout    = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_hitpos_ao)));
     g_hitpos_ao->SetName(L"Hit position");
 
+    D3D12_HEAP_PROPERTIES props1 = props;
+    props1.Type                  = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc1    = desc;
+    desc1.Flags                  = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao_readback)));
+    CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao)));
+    g_hitpos_ao_readback->SetName(L"Hit position readback");
+
+    // Mapping
+    desc.Width = RT_W * RT_H * sizeof(int);
+    desc1.Width = desc.Width;
+    props1.Type = D3D12_HEAP_TYPE_UPLOAD;
+    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_ray_mapping_upload)));
+    CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_ray_mapping)));
+    g_ray_mapping_upload->SetName(L"Ray mapping upload");
+    g_ray_mapping->SetName(L"Ray mapping");
+
+    // Raydirs
+    desc.Width = RT_W * RT_H * sizeof(float) * 3;
+    desc1.Width = desc.Width;
+    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs_upload)));
+    CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs)));
+    g_aoray_dirs->SetName(L"AO ray dirs");
+    g_aoray_dirs_upload->SetName(L"AO ray dirs upload");
+
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 6;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal
+    heap_desc.NumDescriptors = 8;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
@@ -494,13 +724,21 @@ void InitDX12Stuff()
     uav_desc.Buffer.CounterOffsetInBytes = 0;
     uav_desc.Buffer.FirstElement         = 0;
     uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_NONE;
-    uav_desc.Buffer.NumElements          = WIN_W * WIN_H;
+    uav_desc.Buffer.NumElements          = RT_W * RT_H;
     uav_desc.Buffer.StructureByteStride  = sizeof(float) * 4;
     g_device12->CreateUnorderedAccessView(g_hitpos_ao, nullptr, &uav_desc, handle);
 
+    uav_desc.Buffer.StructureByteStride = sizeof(float);
+    handle.ptr += g_srv_uav_cbv_descriptor_size;
+    g_device12->CreateUnorderedAccessView(g_ray_mapping, nullptr, &uav_desc, handle);
+
+    uav_desc.Buffer.StructureByteStride = sizeof(float) * 3;
+    handle.ptr += g_srv_uav_cbv_descriptor_size;
+    g_device12->CreateUnorderedAccessView(g_aoray_dirs, nullptr, &uav_desc, handle);
+
     // Root params for drawing the FSQUAD
     {
-        D3D12_ROOT_PARAMETER root_params[1];
+        D3D12_ROOT_PARAMETER root_params[1]{};
         root_params[0].ParameterType    = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -600,21 +838,14 @@ void InitDX12Stuff()
         pso_desc.RasterizerState.AntialiasedLineEnable    = FALSE;
         pso_desc.RasterizerState.ForcedSampleCount        = 0;
         pso_desc.RasterizerState.ConservativeRaster       = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-        pso_desc.DepthStencilState.DepthEnable            = TRUE;
-        pso_desc.DepthStencilState.DepthWriteMask         = D3D12_DEPTH_WRITE_MASK_ALL;
-        pso_desc.DepthStencilState.DepthFunc              = D3D12_COMPARISON_FUNC_LESS;
+        pso_desc.DepthStencilState.DepthEnable            = FALSE;
         pso_desc.DepthStencilState.StencilEnable          = FALSE;
-        pso_desc.DepthStencilState.StencilReadMask        = D3D12_DEFAULT_STENCIL_READ_MASK;
-        pso_desc.DepthStencilState.StencilWriteMask       = D3D12_DEFAULT_STENCIL_WRITE_MASK;
-        const D3D12_DEPTH_STENCILOP_DESC defaultStencilOp = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
-        pso_desc.DepthStencilState.FrontFace              = defaultStencilOp;
-        pso_desc.DepthStencilState.BackFace               = defaultStencilOp;
         pso_desc.InputLayout.pInputElementDescs           = input_element_descs;
         pso_desc.InputLayout.NumElements                  = _countof(input_element_descs);
         pso_desc.PrimitiveTopologyType                    = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso_desc.NumRenderTargets                         = 1;
         pso_desc.RTVFormats[0]                            = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso_desc.DSVFormat                                = DXGI_FORMAT_D32_FLOAT;
+        pso_desc.DSVFormat                                = DXGI_FORMAT_UNKNOWN;
         pso_desc.SampleDesc.Count                         = 1;
         CE(g_device12->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&g_pipeline_fsquad)));
         g_pipeline_fsquad->SetName(L"FSQuad pipeline");
@@ -728,8 +959,8 @@ void CreateRTPipeline()
         if (error)
             error->Release();
 
-        desc_ranges[4].RangeType      = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Hit position
-        desc_ranges[4].NumDescriptors = 1;
+        desc_ranges[4].RangeType      = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Hit position, mapping, Raydirs
+        desc_ranges[4].NumDescriptors = 3;
         desc_ranges[4].BaseShaderRegister = 1;
         desc_ranges[4].RegisterSpace      = 0;
         desc_ranges[4].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1038,6 +1269,8 @@ void Render()
     GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
     cb.invert_y   = g_invert_y;
     cb.ao_samples = g_ao_sample_count;
+    cb.use_ray_binning = g_use_ray_binning;
+    cb.ao_radius       = g_ao_radius;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 
@@ -1073,6 +1306,12 @@ void Render()
         // Dispatch ray
         D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
 
+        D3D12_RESOURCE_BARRIER hitpos_barrier{};
+        hitpos_barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        hitpos_barrier.Transition.pResource   = g_hitpos_ao;
+        hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+        hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
         D3D12_DISPATCH_RAYS_DESC desc{};
         if (g_use_ao == false)
         {
@@ -1086,8 +1325,8 @@ void Render()
             desc.MissShaderTable.SizeInBytes            = 64;
             desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
             desc.HitGroupTable.SizeInBytes              = 64;
-            desc.Width                                  = WIN_W;
-            desc.Height                                 = WIN_H;
+            desc.Width                                  = RT_W;
+            desc.Height                                 = RT_H;
             desc.Depth                                  = 1;
             g_command_list->DispatchRays(&desc);
         }
@@ -1098,29 +1337,33 @@ void Render()
             g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
             g_command_list->SetPipelineState1(g_rt_state_object_ao);
 
-            D3D12_RESOURCE_BARRIER hitpos_barrier{};
-            hitpos_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            hitpos_barrier.Transition.pResource = g_hitpos_ao;
-            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
-            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             g_command_list->ResourceBarrier(1, &hitpos_barrier);
 
-            // Primary Rays
-            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
-            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
-            desc.MissShaderTable.SizeInBytes            = 64;
-            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress();
-            desc.HitGroupTable.SizeInBytes              = 64;
-            desc.Width                                  = WIN_W;
-            desc.Height                                 = WIN_H;
-            desc.Depth                                  = 1;
-            g_command_list->DispatchRays(&desc);
+            if (g_force_hitpos_dirty)
+            {
+                g_hitpos_dirty = true;
+            }
+            if (g_hitpos_dirty)
+            {
+                // Primary Rays
+                desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
+                desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+                desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
+                desc.MissShaderTable.SizeInBytes            = 64;
+                desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress();
+                desc.HitGroupTable.SizeInBytes              = 64;
+                desc.Width                                  = RT_W;
+                desc.Height                                 = RT_H;
+                desc.Depth                                  = 1;
+                g_command_list->DispatchRays(&desc);
 
-            D3D12_RESOURCE_BARRIER uav_barrier{};
-            uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            uav_barrier.UAV.pResource = g_hitpos_ao;
-            g_command_list->ResourceBarrier(1, &uav_barrier);
+                D3D12_RESOURCE_BARRIER uav_barrier{};
+                uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav_barrier.UAV.pResource = g_hitpos_ao;
+                g_command_list->ResourceBarrier(1, &uav_barrier);
+
+                g_hitpos_dirty = false;
+            }
 
             // AO Rays
             desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress() + 64;
@@ -1129,18 +1372,28 @@ void Render()
             desc.MissShaderTable.SizeInBytes            = 64;
             desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress() + 64;
             desc.HitGroupTable.SizeInBytes              = 64;
-            desc.Width                                  = WIN_W;
-            desc.Height                                 = WIN_H;
+            desc.Width                                  = RT_W;
+            desc.Height                                 = RT_H;
             desc.Depth                                  = 1;
             g_command_list->DispatchRays(&desc);
-
-            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-            g_command_list->ResourceBarrier(1, &hitpos_barrier);
         }
 
         g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
         g_command_list->ResolveQueryData(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g_query_readback_buffer, 0);
+
+        if (g_use_ao)
+        {
+
+            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            g_command_list->ResourceBarrier(1, &hitpos_barrier);
+
+            g_command_list->CopyResource(g_hitpos_ao_readback, g_hitpos_ao);
+
+            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+            g_command_list->ResourceBarrier(1, &hitpos_barrier);
+        }
 
         if (0)  // COPY
         {
@@ -1166,9 +1419,9 @@ void Render()
 
             g_command_list->SetGraphicsRootSignature(g_rootsig_fsquad);
             g_command_list->SetPipelineState(g_pipeline_fsquad);
+            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap_fsquad);
             D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_fsquad_handle(g_srv_uav_cbv_heap_fsquad->GetGPUDescriptorHandleForHeapStart());
             g_command_list->SetGraphicsRootDescriptorTable(0, srv_uav_cbv_fsquad_handle);
-            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap_fsquad);
 
             D3D12_VIEWPORT viewport{};
             viewport.TopLeftX = 0;
@@ -1193,7 +1446,7 @@ void Render()
             g_command_list->DrawInstanced(3, 1, 0, 0);
 
             barrier_rt_out.Transition.StateBefore  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier_rt_out.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            barrier_rt_out.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_command_list->ResourceBarrier(1, &barrier_rt_out);
 
             barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1213,6 +1466,200 @@ void Render()
     CE(g_swapchain->Present(1, 0));
     WaitForPreviousFrame();
     CE(g_command_allocator->Reset());
+
+    // Read back ray dirs
+    if (g_use_ray_binning > 0)
+    {
+        if (g_ray_mapping_dirty)
+        {
+            CE(g_command_list->Reset(g_command_allocator, nullptr));
+
+            glm::vec4*  mapped{};  // Normal and T
+            D3D12_RANGE read_range{};
+            read_range.Begin = 0;
+            read_range.End   = sizeof(float) * 3 * RT_W * RT_H;
+            g_hitpos_ao_readback->Map(0, &read_range, (void**)(&mapped));
+            std::vector<std::pair<glm::vec4, int>> tmp;
+
+            for (int i = 0; i < RT_W * RT_H; i++)
+            {
+                glm::vec4 nt   = mapped[i];
+                int       seed = TEA(i, 0, 16).x;
+                glm::vec3 dir  = SampleHemisphereCosine(glm::vec3(nt), seed);
+                tmp.push_back(std::make_pair(glm::vec4(dir, nt.w), i));
+            }
+            g_hitpos_ao_readback->Unmap(0, nullptr);
+            
+            // Global two-point ... ?
+            if (g_use_ray_binning == 2)
+            {
+                std::vector<std::pair<unsigned, int>> tmp1;
+                for (int i = 0; i < RT_W * RT_H; i++)
+                {
+                    float dx = (float(i % RT_W) + 0.5f) / RT_W * 2 - 1;
+                    float dy = (float(i / RT_W) + 0.5f) / RT_H * 2 - 1;
+                    dy *= -1;
+                    if (g_invert_y)
+                        dy *= -1;
+                    glm::vec3 d(dx, dy, 1);
+                    glm::vec3 tgt = TransformPosition(g_inv_proj, d);
+                    glm::vec3 dir = TransformDirection(g_inv_view, glm::normalize(tgt));
+                    
+                    std::pair<glm::vec4, int>& entry = tmp[i];
+
+                    glm::vec3 o = g_cam_pos + (dir * entry.first.w);
+                    glm::vec3 ao_d = glm::vec3(entry.first);
+                    glm::vec3 t = o + ao_d * 10.0f;
+
+                    glm::vec3 t01    = Constrain((t - g_scene_aabb_min) / (g_scene_aabb_max - g_scene_aabb_min));
+                    int       code_t = (int(32 * t01.x) << 10) | (int(32 * t01.y) << 5) | (int(32 * t01.z));
+                    glm::vec3 o01    = Constrain((o - g_scene_aabb_min) / (g_scene_aabb_max - g_scene_aabb_min));
+                    int       code_o = (int(64 * o01.x) << 11) | (int(64 * o01.y) << 5) | (int(32 * o01.z));
+                    unsigned sort_key = (((code_o >> 14) & 7) << 29) |
+                                   (((code_t >> 12) & 7) << 26) |
+                                   (((code_o >> 11) & 7) << 23) |
+                                   (((code_t >>  9) & 7) << 20) |
+                                   (((code_o >>  8) & 7) << 17) |
+                                   (((code_t >>  6) & 7) << 14) |
+                                   (((code_o >>  5) & 7) << 11) |
+                                   (((code_t >>  3) & 7) <<  8) |
+                                   (((code_o >>  2) & 7) <<  5) |
+                                   (((code_t      ) & 7) <<  3) |
+                                   (((code_o      ) & 3));
+                    tmp1.push_back(std::make_pair(sort_key, i));
+
+                    if (i % 100 == 0)
+                        printf("(%g,%g), code_o=0x%08x, code_t=0x%08x, sortkey=0x%08x\n", dx, dy, code_o, code_t, sort_key);
+                }
+                sort(tmp1.begin(), tmp1.end());
+                std::vector<std::pair<glm::vec4, int>> tmp2;
+                for (const auto& x : tmp1)
+                {
+                    tmp2.push_back(tmp.at(x.second));
+                }
+                tmp = tmp2;
+            }
+
+            // Sorting happens here
+            const int BLK_W = 32, BLK_H = 32;
+            for (int y0 = 0; y0 < RT_H; y0 += BLK_H)
+            {
+                for (int x0 = 0; x0 < RT_W; x0 += BLK_W)
+                {
+                    // Record original data
+                    std::vector<std::pair<glm::vec4, int>> block;
+                    for (int y1 = 0; y1 < BLK_H; y1++)
+                    {
+                        for (int x1 = 0; x1 < BLK_W; x1++)
+                        {
+                            if (x1 + x0 >= RT_W || y1 + y0 >= RT_H)
+                                continue;
+                            block.push_back(tmp[(x1 + x0) + (y1 + y0) * RT_W]);
+                        }
+                    }
+
+                    // Sort block
+                    if (g_use_ray_binning == 3)
+                    {
+                        const int NUM_BINS_W = 4, NUM_BINS_H = 4;
+                        std::vector<int> occs(NUM_BINS_W * NUM_BINS_H);
+                        std::vector<int> bin_idxes;
+                        for (const auto& x : block)
+                        {
+                            glm::vec2 enc = OctEncode(glm::vec3(x.first));
+                            int       bidx = NUM_BINS_H * NUM_BINS_W - 1;
+                            if (!isnan(enc.x))
+                            {
+                                int gridx = int(enc.x * NUM_BINS_W);
+                                int gridy = int(enc.y * NUM_BINS_H);
+                                assert(gridx >= 0 && gridx < NUM_BINS_W);
+                                assert(gridy >= 0 && gridy < NUM_BINS_H);
+                                bidx = gridy * NUM_BINS_W + gridx;
+                            }
+                            bin_idxes.push_back(bidx);
+                            occs[bidx]++;
+                        }
+
+                        std::vector<int> offsets(NUM_BINS_W * NUM_BINS_H);
+
+                        int s = 0;
+                        for (int i = 0; i < NUM_BINS_W * NUM_BINS_H; i++)
+                        {
+                            offsets[i] = s;
+                            s += occs[i];
+                        }
+
+                        std::vector<std::pair<glm::vec4, int>> block_binned(BLK_W * BLK_H);
+                        for (int i = 0; i < block.size(); i++)
+                        {
+                            int bidx = bin_idxes[i];
+                            block_binned[offsets[bidx]++] = block[i];
+                        }
+                        block = block_binned;
+                    }
+
+                    // Put back
+                    int bidx = 0;
+                    for (int y1 = 0; y1 < BLK_H; y1++)
+                    {
+                        for (int x1 = 0; x1 < BLK_W; x1++)
+                        {
+                            if (x1 + x0 >= RT_W || y1 + y0 >= RT_H)
+                                continue;
+                            tmp[(x1 + x0) + (y1 + y0) * RT_W] = block[bidx];
+                            bidx++;
+                        }
+                    }
+                }
+            }
+
+            std::vector<glm::vec3> raydirs;
+            std::vector<int>       raymappings;
+            for (int i = 0; i < RT_W * RT_H; i++)
+            {
+                raydirs.push_back(glm::vec3(tmp[i].first));
+                raymappings.push_back(tmp[i].second);
+            }
+
+            void* mapped1;
+            g_aoray_dirs_upload->Map(0, nullptr, &mapped1);
+            memcpy(mapped1, raydirs.data(), sizeof(glm::vec3) * RT_W * RT_H);
+            g_aoray_dirs_upload->Unmap(0, nullptr);
+
+            g_ray_mapping_upload->Map(0, nullptr, &mapped1);
+            memcpy(mapped1, raymappings.data(), sizeof(int) * RT_W * RT_H);
+            g_ray_mapping_upload->Unmap(0, nullptr);
+
+            D3D12_RESOURCE_BARRIER bar{};
+            bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bar.Transition.pResource   = g_aoray_dirs;
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_command_list->ResourceBarrier(1, &bar);
+            g_command_list->CopyResource(g_aoray_dirs, g_aoray_dirs_upload);
+
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+            g_command_list->ResourceBarrier(1, &bar);
+
+            bar.Transition.pResource   = g_ray_mapping;
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_command_list->ResourceBarrier(1, &bar);
+            g_command_list->CopyResource(g_ray_mapping, g_ray_mapping_upload);
+
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+            g_command_list->ResourceBarrier(1, &bar);
+
+            g_ray_mapping_dirty = false;
+
+            CE(g_command_list->Close());
+            g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_command_list);
+            WaitForPreviousFrame();
+            CE(g_command_allocator->Reset());
+        }
+    }
 
     // Read timer
     uint64_t freq{0};
@@ -1234,7 +1681,34 @@ void Render()
         }
         else
         {
-            ss << "MyRRAPlayground ";
+            if (g_benchmarkState == BenchmarkState::BENCHMARKING)
+            {
+                if (g_frame_time.ShouldUpdate())
+                {
+                    g_bmk_ft_count++;
+                    if (g_bmk_ft_count > 5)
+                    {
+                        
+                        g_bmk_ft_count = 0;
+                        g_bmk_frametimes.push_back(g_frame_time.GetFrameTime() * 1000);
+                        printf("Benchmarked sample count %d/%d = %g ms\n", g_ao_sample_count, BMK_AO_SAMPLE_COUNT_LIMIT, g_bmk_frametimes.back());
+                        g_ao_sample_count++;
+                        if (g_ao_sample_count > BMK_AO_SAMPLE_COUNT_LIMIT)
+                        {
+                            g_ao_sample_count = 1;
+                            g_benchmarkState  = BenchmarkState::NOT_STARTED;
+                            printf("BMK results\n");
+                            for (unsigned i = 0; i < g_bmk_frametimes.size(); i++)
+                            {
+                                printf("%g\n", g_bmk_frametimes[i]);
+                            }
+                            g_bmk_frametimes.clear();
+                        }
+                    }
+                }
+            }
+
+            ss << "MyRRAPlayground Render res " << std::to_string(RT_W) << "x" << std::to_string(RT_H) << " ";
             ss << std::setprecision(4) << (g_frame_time.GetFrameTime() * 1000) << "ms/frame";
             if (g_use_ao)
             {
@@ -1242,7 +1716,15 @@ void Render()
             }
             else
             {
-                ss << " primary ray";
+                ss << " primary_ray";
+            }
+            if (g_force_hitpos_dirty)
+            {
+                ss << " force_hitpos_dirty";
+            }
+            if (g_use_ray_binning)
+            {
+                ss << " ray_binning=" << std::to_string(g_use_ray_binning);
             }
             glfwSetWindowTitle(g_window, ss.str().c_str());
         }
@@ -1660,6 +2142,9 @@ void LoadCubeAndCreateAS()
     info.transform[5]  = 1;
     info.transform[10] = 1;
 
+    g_scene_aabb_min = {-1, -1, -1};
+    g_scene_aabb_max = {1, 1, 1};
+
     std::vector<InstanceInfo> infos = {info};
 
     CreateAS(verts, infos);
@@ -1670,7 +2155,7 @@ void LoadCubeAndCreateAS()
     glm::vec3 up(0, 1, 0);
 
     glm::mat4 view = glm::lookAt(eye, center, up);
-    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
+    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
 
     g_inv_view = glm::inverse(view);
     g_inv_proj = glm::inverse(proj);
@@ -1922,6 +2407,24 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                             instance_infos.resize(iidx + 1);
                         }
                         instance_infos[iidx] = ii;
+
+                        // Refresh the scene's AABB
+                        std::vector<Vertex>& verts = vertices.at(ii.blas_idx);
+                        for (const Vertex& v : verts)
+                        {
+                            DirectX::XMFLOAT3 vt{};
+                            DirectX::XMFLOAT3 p = v.position;
+                            float*             t = ii.transform;
+                            vt.x                 = t[3] + t[0] * p.x + t[1] * p.y + t[2] * p.z;
+                            vt.y                 = t[7] + t[4] * p.x + t[5] * p.y + t[6] * p.z;
+                            vt.z                 = t[11] + t[8] * p.x + t[9] * p.y + t[10] * p.z;
+                            g_scene_aabb_min.x   = std::min(g_scene_aabb_min.x, vt.x);
+                            g_scene_aabb_min.y   = std::min(g_scene_aabb_min.y, vt.y);
+                            g_scene_aabb_min.z   = std::min(g_scene_aabb_min.z, vt.z);
+                            g_scene_aabb_max.x   = std::max(g_scene_aabb_max.x, vt.x);
+                            g_scene_aabb_max.y   = std::max(g_scene_aabb_max.y, vt.y);
+                            g_scene_aabb_max.z   = std::max(g_scene_aabb_max.z, vt.z);
+                        }
                     }
                 }
             }
@@ -1934,6 +2437,14 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
         }
     }
 
+    printf("Scene AABB: (%g,%g,%g)-(%g,%g,%g)\n",
+           g_scene_aabb_min.x,
+           g_scene_aabb_min.y,
+           g_scene_aabb_min.z,
+           g_scene_aabb_max.x,
+           g_scene_aabb_max.y,
+           g_scene_aabb_max.z);
+
     CreateAS(vertices, tlas0_inst_infos);
 
     // Set Camera
@@ -1945,18 +2456,20 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     std::string fn(g_rra_file_name);
     for (const auto& entry : CAM_PARAMS)
     {
+        printf("Comparing %s vs %s..\n", entry.first.c_str(), fn.c_str());
         if (fn.find(entry.first) != std::string::npos)
         {
             printf("Using camera params for %s\n", entry.first.c_str());
-            eye      = entry.second.eye;
-            center   = entry.second.center;
-            up       = entry.second.up;
+            eye        = entry.second.eye;
+            center     = entry.second.center;
+            up         = entry.second.up;
+            g_cam_pos  = eye;
             g_invert_y = entry.second.invert_y;
         }
     }
 
     glm::mat4 view = glm::lookAt(eye, center, up);
-    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * WIN_W / WIN_H, -0.1f, -499.0f) * (-1.0f);
+    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
 
     g_inv_view = glm::inverse(view);
     g_inv_proj = glm::inverse(proj);
@@ -1981,12 +2494,12 @@ int main(int argc, char** argv)
     {
         if (!strcmp(argv[i], "-w") && i + 1 < argc)
         {
-            WIN_W = std::atoi(argv[i + 1]);
+            RT_W = std::atoi(argv[i + 1]);
             i++;
         }
         else if (!strcmp(argv[i], "-h") && i + 1 < argc)
         {
-            WIN_H = std::atoi(argv[i + 1]);
+            RT_H = std::atoi(argv[i + 1]);
             i++;
         }
         else if (!strcmp(argv[i], "-i") && i + 1 < argc)

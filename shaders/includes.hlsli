@@ -9,7 +9,9 @@ cbuffer RayGenCB : register(b0)
     float4x4 inverse_view;
     float4x4 inverse_proj;
     bool invert_y;
+    int use_ray_binning;
     int ao_samples;
+    float ao_radius;
 };
 
 float3 TransformPosition(float4x4 m, float3 x)
