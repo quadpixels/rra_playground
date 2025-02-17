@@ -675,7 +675,7 @@ void InitDX12Stuff()
     desc.Width = RT_W * RT_H * sizeof(int);
     desc1.Width = desc.Width;
     props1.Type = D3D12_HEAP_TYPE_UPLOAD;
-    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_ray_mapping_upload)));
+    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_ray_mapping_upload)));
     CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_ray_mapping)));
     g_ray_mapping_upload->SetName(L"Ray mapping upload");
     g_ray_mapping->SetName(L"Ray mapping");
@@ -683,7 +683,7 @@ void InitDX12Stuff()
     // Raydirs
     desc.Width = RT_W * RT_H * sizeof(float) * 3;
     desc1.Width = desc.Width;
-    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs_upload)));
+    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_aoray_dirs_upload)));
     CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs)));
     g_aoray_dirs->SetName(L"AO ray dirs");
     g_aoray_dirs_upload->SetName(L"AO ray dirs upload");
