@@ -38,6 +38,20 @@
 #undef min
 #undef max
 
+struct RayInPixDumpFileMinimal
+{
+    //uint32_t   type;
+    //glm::uvec3 dispatch_rays_idx;
+    glm::vec3  origin;
+    float      tmin;
+    glm::vec3  direction;
+    float      tcurrent;
+    //uint32_t   ray_flags;
+};
+std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
+glm::uvec3                         g_ray_in_pix_dispatch_dims;
+bool                               g_use_ray_in_pix{false};
+
 struct FrameTime
 {
     std::vector<float> samples;  // elapsed, frame_time
@@ -87,7 +101,9 @@ std::map<std::string, CamParams> CAM_PARAMS = {
     {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
     {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
     {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
-    {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}}};
+    {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}},
+    {"VictorStones", {glm::vec3(54.20388, -360.680725, 20.8701935), glm::vec3(93.000, -316.9831, 29.51616), glm::vec3(0, 0, 1), true}}
+};
 
 struct Vertex
 {
@@ -106,6 +122,10 @@ struct RayGenCB
     int               use_ray_binning;
     int               ao_samples;
     float             ao_radius;
+    uint32_t          load_ray_from_buffer;
+    uint32_t          buffer_w;
+    uint32_t          buffer_h;
+    uint32_t          buffer_d;
 };
 
 int WIN_W = 1280, WIN_H = 720;
@@ -169,6 +189,9 @@ bool            g_hitpos_dirty{true};
 
 ID3D12QueryHeap* g_query_heap;
 ID3D12Resource*  g_query_readback_buffer;
+
+ID3D12Resource* g_rays_in_pix_buffer;
+ID3D12Resource* g_rays_in_pix_buffer_upload;
 
 bool g_use_ao{false};
 int g_use_ray_binning{0};
@@ -464,6 +487,12 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             }
             break;
         }
+        case GLFW_KEY_P:
+        {
+            g_use_ray_in_pix = !g_use_ray_in_pix;
+            printf("g_use_ray_in_pix = %d\n", g_use_ray_in_pix);
+            break;
+        }
         default:
             break;
         }
@@ -588,6 +617,7 @@ void InitDeviceAndCommandQ()
     CE(g_device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)));
     g_fence_value = 1;
     g_fence_event = CreateEvent(nullptr, false, false, L"Fence");
+    g_command_queue->SetName(L"Command Queue");
 }
 
 void InitSwapChain()
@@ -628,10 +658,12 @@ void InitDX12Stuff()
     CE(g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_command_allocator)));
     CE(g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_command_allocator, nullptr, IID_PPV_ARGS(&g_command_list)));
     g_command_list->Close();
+    g_command_list->SetName(L"Command List");
 
     CE(g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_command_allocator1)));
     CE(g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_command_allocator, nullptr, IID_PPV_ARGS(&g_command_list1)));
     g_command_list1->Close();
+    g_command_list1->SetName(L"Command List 1");
 
     // RT output resource
     D3D12_RESOURCE_DESC desc{};
@@ -667,12 +699,13 @@ void InitDX12Stuff()
     props1.Type                  = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC desc1    = desc;
     desc1.Flags                  = D3D12_RESOURCE_FLAG_NONE;
-    CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao_readback)));
+    CE(g_device12->CreateCommittedResource(
+        &props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao_readback)));
     CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao)));
     g_hitpos_ao_readback->SetName(L"Hit position readback");
 
     // Mapping
-    desc.Width = RT_W * RT_H * sizeof(int);
+    desc.Width  = RT_W * RT_H * sizeof(int);
     desc1.Width = desc.Width;
     props1.Type = D3D12_HEAP_TYPE_UPLOAD;
     CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_ray_mapping_upload)));
@@ -681,7 +714,7 @@ void InitDX12Stuff()
     g_ray_mapping->SetName(L"Ray mapping");
 
     // Raydirs
-    desc.Width = RT_W * RT_H * sizeof(float) * 3;
+    desc.Width  = RT_W * RT_H * sizeof(float) * 3;
     desc1.Width = desc.Width;
     CE(g_device12->CreateCommittedResource(&props1, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_aoray_dirs_upload)));
     CE(g_device12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs)));
@@ -690,12 +723,67 @@ void InitDX12Stuff()
 
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 8;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs
+    heap_desc.NumDescriptors = 9;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
     g_srv_uav_cbv_heap->SetName(L"SRV UAV CBV heap");
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    
+    if (g_rays_in_pix_dumpfile_minimal.size() > 0)
+    {
+        D3D12_RESOURCE_DESC res_desc{};
+        res_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+        res_desc.Alignment          = 0;
+        res_desc.Height             = 1;
+        res_desc.DepthOrArraySize   = 1;
+        res_desc.MipLevels          = 1;
+        res_desc.Format             = DXGI_FORMAT_UNKNOWN;
+        res_desc.SampleDesc.Count   = 1;
+        res_desc.SampleDesc.Quality = 0;
+        res_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        res_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+        res_desc.Width              = sizeof(RayInPixDumpFileMinimal) * g_rays_in_pix_dumpfile_minimal.size();
+        CE(g_device12->CreateCommittedResource(
+            &props1, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer_upload)));
+        CE(g_device12->CreateCommittedResource(
+            &props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer)));
+
+        char* mapped;
+        g_rays_in_pix_buffer_upload->Map(0, nullptr, (void**)(&mapped));
+        memcpy(mapped, g_rays_in_pix_dumpfile_minimal.data(), res_desc.Width);
+        g_rays_in_pix_buffer_upload->Unmap(0, nullptr);
+
+        g_command_list1->Reset(g_command_allocator1, nullptr);
+
+        g_command_list1->CopyResource(g_rays_in_pix_buffer, g_rays_in_pix_buffer_upload);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = g_rays_in_pix_buffer;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+        barrier.Transition.Subresource = 0;
+        g_command_list1->ResourceBarrier(1, &barrier);
+
+        g_command_list1->Close();
+        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
+
+        // SRV of RT output resource
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Buffer.FirstElement        = 0;
+        srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+        srv_desc.Buffer.NumElements         = g_rays_in_pix_dumpfile_minimal.size();
+        srv_desc.Buffer.StructureByteStride = sizeof(RayInPixDumpFileMinimal);
+        srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+        srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+        handle.ptr = g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 8 * g_srv_uav_cbv_descriptor_size;
+        g_device12->CreateShaderResourceView(g_rays_in_pix_buffer, &srv_desc, handle);
+    }
 
     // Query heap
     D3D12_QUERY_HEAP_DESC qhd{};
@@ -753,7 +841,7 @@ void InitDX12Stuff()
         root_params[0].DescriptorTable.pDescriptorRanges   = desc_ranges;
 
         D3D12_STATIC_SAMPLER_DESC sampler_desc{};
-        sampler_desc.ShaderRegister = 0;
+        sampler_desc.ShaderRegister   = 0;
         sampler_desc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         sampler_desc.Filter           = D3D12_FILTER_ANISOTROPIC;
         sampler_desc.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -803,9 +891,9 @@ void InitDX12Stuff()
                                                           {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA}};
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
-        pso_desc.pRootSignature     = g_rootsig_fsquad;
-        pso_desc.VS.pShaderBytecode = vs_blob->GetBufferPointer();
-        pso_desc.VS.BytecodeLength  = vs_blob->GetBufferSize();
+        pso_desc.pRootSignature                                           = g_rootsig_fsquad;
+        pso_desc.VS.pShaderBytecode                                       = vs_blob->GetBufferPointer();
+        pso_desc.VS.BytecodeLength                                        = vs_blob->GetBufferSize();
         pso_desc.PS.pShaderBytecode                                       = ps_blob->GetBufferPointer();
         pso_desc.PS.BytecodeLength                                        = ps_blob->GetBufferSize();
         const D3D12_RENDER_TARGET_BLEND_DESC defaultRenderTargetBlendDesc = {
@@ -826,27 +914,27 @@ void InitDX12Stuff()
         {
             pso_desc.BlendState.RenderTarget[i] = defaultRenderTargetBlendDesc;
         }
-        pso_desc.SampleMask                               = UINT_MAX;
-        pso_desc.RasterizerState.FillMode                 = D3D12_FILL_MODE_SOLID;
-        pso_desc.RasterizerState.CullMode                 = D3D12_CULL_MODE_NONE;
-        pso_desc.RasterizerState.FrontCounterClockwise    = FALSE;
-        pso_desc.RasterizerState.DepthBias                = D3D12_DEFAULT_DEPTH_BIAS;
-        pso_desc.RasterizerState.DepthBiasClamp           = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-        pso_desc.RasterizerState.SlopeScaledDepthBias     = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
-        pso_desc.RasterizerState.DepthClipEnable          = TRUE;
-        pso_desc.RasterizerState.MultisampleEnable        = FALSE;
-        pso_desc.RasterizerState.AntialiasedLineEnable    = FALSE;
-        pso_desc.RasterizerState.ForcedSampleCount        = 0;
-        pso_desc.RasterizerState.ConservativeRaster       = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-        pso_desc.DepthStencilState.DepthEnable            = FALSE;
-        pso_desc.DepthStencilState.StencilEnable          = FALSE;
-        pso_desc.InputLayout.pInputElementDescs           = input_element_descs;
-        pso_desc.InputLayout.NumElements                  = _countof(input_element_descs);
-        pso_desc.PrimitiveTopologyType                    = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pso_desc.NumRenderTargets                         = 1;
-        pso_desc.RTVFormats[0]                            = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso_desc.DSVFormat                                = DXGI_FORMAT_UNKNOWN;
-        pso_desc.SampleDesc.Count                         = 1;
+        pso_desc.SampleMask                            = UINT_MAX;
+        pso_desc.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+        pso_desc.RasterizerState.FrontCounterClockwise = FALSE;
+        pso_desc.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+        pso_desc.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+        pso_desc.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+        pso_desc.RasterizerState.DepthClipEnable       = TRUE;
+        pso_desc.RasterizerState.MultisampleEnable     = FALSE;
+        pso_desc.RasterizerState.AntialiasedLineEnable = FALSE;
+        pso_desc.RasterizerState.ForcedSampleCount     = 0;
+        pso_desc.RasterizerState.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+        pso_desc.DepthStencilState.DepthEnable         = FALSE;
+        pso_desc.DepthStencilState.StencilEnable       = FALSE;
+        pso_desc.InputLayout.pInputElementDescs        = input_element_descs;
+        pso_desc.InputLayout.NumElements               = _countof(input_element_descs);
+        pso_desc.PrimitiveTopologyType                 = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets                      = 1;
+        pso_desc.RTVFormats[0]                         = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso_desc.DSVFormat                             = DXGI_FORMAT_UNKNOWN;
+        pso_desc.SampleDesc.Count                      = 1;
         CE(g_device12->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&g_pipeline_fsquad)));
         g_pipeline_fsquad->SetName(L"FSQuad pipeline");
 
@@ -892,9 +980,9 @@ void InitDX12Stuff()
         heap_props.CreationNodeMask     = 1;
         heap_props.VisibleNodeMask      = 1;
 
-        ID3D12Resource* d_all_verts;
         CE(g_device12->CreateCommittedResource(
             &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_fsquad_vb)));
+        g_fsquad_vb->SetName(L"FSQUAD VB");
         char* mapped;
         g_fsquad_vb->Map(0, nullptr, (void**)(&mapped));
         memcpy(mapped, verts, sizeof(verts));
@@ -910,8 +998,9 @@ void CreateRTPipeline()
 {
     // 1. Root parameters (global)
     {
-        D3D12_ROOT_PARAMETER root_params[1];
+        D3D12_ROOT_PARAMETER root_params[2]{};
         root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 
         D3D12_DESCRIPTOR_RANGE desc_ranges[5]{};
         desc_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Output0
@@ -942,10 +1031,22 @@ void CreateRTPipeline()
         root_params[0].DescriptorTable.NumDescriptorRanges = 4;
         root_params[0].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
 
+        // For PIX rays specifically
+        D3D12_DESCRIPTOR_RANGE desc_ranges1[1]{};
+        desc_ranges1[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // Verts and InstanceOffsets
+        desc_ranges1[0].NumDescriptors                    = 1;
+        desc_ranges1[0].BaseShaderRegister                = 3;
+        desc_ranges1[0].RegisterSpace                     = 0;
+        desc_ranges1[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        root_params[1].DescriptorTable.pDescriptorRanges   = desc_ranges1;
+        root_params[1].DescriptorTable.NumDescriptorRanges = 1;
+        root_params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
         D3D12_ROOT_SIGNATURE_DESC rootsig_desc{};
         rootsig_desc.NumStaticSamplers = 0;
         rootsig_desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        rootsig_desc.NumParameters     = 1;
+        rootsig_desc.NumParameters     = 2;
         rootsig_desc.pParameters       = root_params;
 
         ID3DBlob *signature, *error;
@@ -1271,6 +1372,10 @@ void Render()
     cb.ao_samples = g_ao_sample_count;
     cb.use_ray_binning = g_use_ray_binning;
     cb.ao_radius       = g_ao_radius;
+    cb.load_ray_from_buffer = g_use_ray_in_pix;
+    cb.buffer_w             = g_ray_in_pix_dispatch_dims.x;
+    cb.buffer_h             = g_ray_in_pix_dispatch_dims.y;
+    cb.buffer_d             = g_ray_in_pix_dispatch_dims.z;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 
@@ -1305,6 +1410,8 @@ void Render()
 
         // Dispatch ray
         D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+        D3D12_GPU_DESCRIPTOR_HANDLE pix_rays_dump_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+        pix_rays_dump_handle.ptr += 8 * g_srv_uav_cbv_descriptor_size;
 
         D3D12_RESOURCE_BARRIER hitpos_barrier{};
         hitpos_barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1318,6 +1425,7 @@ void Render()
             g_command_list->SetComputeRootSignature(g_global_rootsig);
             g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
             g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
             g_command_list->SetPipelineState1(g_rt_state_object);
             desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
             desc.RayGenerationShaderRecord.SizeInBytes  = 64;
@@ -1335,6 +1443,7 @@ void Render()
             g_command_list->SetComputeRootSignature(g_global_rootsig_ao);
             g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
             g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
             g_command_list->SetPipelineState1(g_rt_state_object_ao);
 
             g_command_list->ResourceBarrier(1, &hitpos_barrier);
@@ -1791,6 +1900,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         verts_buf->Map(0, &read_range, (void**)(&mapped));
         memcpy(mapped, verts->data(), verts_size);
         verts_buf->Unmap(0, nullptr);
+        verts_buf->SetName(L"Verts Buf BLAS");
 
         D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
         geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
@@ -1843,12 +1953,14 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 
         CE(g_device12->CreateCommittedResource(
             &heap_props, D3D12_HEAP_FLAG_NONE, &scratch_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&blas_scratch)));
+        blas_scratch->SetName(L"BLAS Scratch");
 
         D3D12_RESOURCE_DESC result_desc = scratch_desc;
         result_desc.Width               = pb_info.ResultDataMaxSizeInBytes;
 
         CE(g_device12->CreateCommittedResource(
             &heap_props, D3D12_HEAP_FLAG_NONE, &result_desc, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&blas_result)));
+        blas_result->SetName(L"BLAS Result");
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc{};
         build_desc.Inputs.Type                      = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
@@ -1871,7 +1983,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 
         g_command_list1->Close();
         g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
-        WaitForPreviousFrame();
+        //WaitForPreviousFrame();
 
         //blas_scratch->Release();
         blases.push_back(blas_result);
@@ -1986,11 +2098,13 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
     CE(g_device12->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &scratch_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tlas_scratch)));
+    tlas_scratch->SetName(L"TLAS Scratch");
 
     D3D12_RESOURCE_DESC result_desc = scratch_desc;
     result_desc.Width               = pb_info.ResultDataMaxSizeInBytes;
     CE(g_device12->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &result_desc, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&tlas_result)));
+    tlas_result->SetName(L"TLAS Result");
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_build_desc{};
     tlas_build_desc.Inputs.Type                      = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -2013,9 +2127,10 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 
     g_command_list1->Close();
     g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
-    WaitForPreviousFrame();
-
-    tlas_scratch->Release();
+    //WaitForPreviousFrame();
+    
+    // Cannot release until command is done
+    // tlas_scratch->Release();
 
     // SRV of TLAS
     D3D12_CPU_DESCRIPTOR_HANDLE srv_handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
@@ -2485,8 +2600,61 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     g_raygen_cb->Unmap(0, nullptr);
 }
 
+void ReadPixBufferDump(const char* filename)
+{
+    g_rays_in_pix_dumpfile_minimal.clear();
+    printf("Will print a pix buffer dump, named %s\n", filename);
+    std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
+    if (!ifs.good())
+    {
+        printf("Oh! file %s is not good.\n", filename);
+        exit(0);
+    }
+    uint32_t fsize = static_cast<uint32_t>(ifs.tellg());
+    printf("File size: %u\n", fsize);
+    ifs.close();
+
+    FILE* f = nullptr;
+    fopen_s(&f, filename, "rb");
+
+    struct RayInPixBufferDump
+    {
+        uint32_t   type;
+        glm::uvec3 dispatch_rays_idx;
+        glm::vec3 origin;
+        glm::vec3 direction;
+        float     tmin;
+        float     tcurrent;
+        uint32_t   ray_flags;
+    };
+
+    for (uint32_t i = 0; i < fsize / sizeof(RayInPixBufferDump); i++)
+    {
+        RayInPixBufferDump r{};
+        fread_s(&r, sizeof(r), sizeof(r), 1, f);
+        RayInPixDumpFileMinimal r1{};
+        r1.origin = r.origin;
+        r1.direction = r.direction;
+        r1.tcurrent  = r.tcurrent;
+        r1.tmin      = r.tmin;
+        g_ray_in_pix_dispatch_dims.x = std::max(g_ray_in_pix_dispatch_dims.x, r.dispatch_rays_idx.x + 1);
+        g_ray_in_pix_dispatch_dims.y = std::max(g_ray_in_pix_dispatch_dims.y, r.dispatch_rays_idx.y + 1);
+        g_ray_in_pix_dispatch_dims.z = std::max(g_ray_in_pix_dispatch_dims.z, r.dispatch_rays_idx.z + 1);
+        g_rays_in_pix_dumpfile_minimal.push_back(r1);
+    }
+
+    fclose(f);
+    printf("Read %zu rays\n", g_rays_in_pix_dumpfile_minimal.size());
+}
+
 int main(int argc, char** argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "-pixbufferdump"))
+    {
+        ReadPixBufferDump(argv[2]);
+        exit(0);
+    }
+
     g_rra_file_name      = "3DMarkSolarBay-20241020-003039.rra";
     bool rra_file_exists = true;
 
@@ -2505,6 +2673,11 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-i") && i + 1 < argc)
         {
             g_rra_file_name = argv[i + 1];
+            i++;
+        }
+        else if (!strcmp(argv[i], "-pixbufferdump") || !strcmp(argv[i], "-p"))
+        {
+            ReadPixBufferDump(argv[i + 1]);
             i++;
         }
     }

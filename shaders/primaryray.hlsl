@@ -24,21 +24,48 @@ void RayGen()
     }
 
     float4 ret = c;
+    bool should_skip = false;
     RayDesc ray;
-    ray.Origin = TransformPosition(inverse_view, float3(0, 0, 0));
-    float2 d = (((DispatchRaysIndex().xy + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
-    if (invert_y)
-        d.y *= -1;
-    float3 target = TransformPosition(inverse_proj, float3(d.x, -d.y, 1));
-    ray.Direction = TransformDirection(inverse_view, normalize(target));
-    ray.TMin = 0.001;
-    ray.TMax = 10000.0;
-    HitInfo payload = { float4(0, 0, 0, 1) };
-    TraceRay(Scene,
-        RAY_FLAG_NONE,
-        0xFF, 0, 0, 0, ray, payload);
+
+    if (load_ray_from_buffer > 0)
+    {
+        const uint2 dixy = DispatchRaysIndex().xy;
+        const uint2 ddxy = DispatchRaysDimensions().xy;
+        const uint tidx = dixy.x + dixy.y * ddxy.x;
+        const uint l = buffer_w * buffer_h * buffer_d;
+        if (tidx < l)
+        {
+            RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[tidx];
+            ray.Origin = rpbm.origin;
+            ray.Direction = rpbm.direction;
+            ray.TMin = rpbm.tmin;
+            ray.TMax = 100000.0;
+        }
+        else
+        {
+            should_skip = true;
+        }
+    }
+    else
+    {
+        ray.Origin = TransformPosition(inverse_view, float3(0, 0, 0));
+        float2 d = (((DispatchRaysIndex().xy + 0.5f) / DispatchRaysDimensions().xy) * 2.f - 1.f);
+        if (invert_y)
+            d.y *= -1;
+        float3 target = TransformPosition(inverse_proj, float3(d.x, -d.y, 1));
+        ray.Direction = TransformDirection(inverse_view, normalize(target));
+        ray.TMin = 0.001;
+        ray.TMax = 10000.0;
+    }
     
-    ret = payload.colorAndDistance;
+    if (should_skip == false)
+    {
+        HitInfo payload = { float4(0, 0, 0, 1) };
+        TraceRay(Scene,
+            RAY_FLAG_NONE,
+            0xFF, 0, 0, 0, ray, payload);
+        ret = payload.colorAndDistance;
+    }
     RenderTarget[DispatchRaysIndex().xy] = ret;
 }
 

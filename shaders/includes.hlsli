@@ -1,7 +1,15 @@
+struct RayInPixBufferMinimal
+{
+    float3 origin;
+    float tmin;
+    float3 direction;
+    float tcurrent;
+};
+
 RaytracingAccelerationStructure Scene : register(t0, space0);
 StructuredBuffer<float3> Vertices : register(t1);
 StructuredBuffer<int> InstanceVertOffsets : register(t2);
-
+StructuredBuffer<RayInPixBufferMinimal> RaysInPixBufferMinimal : register(t3);
 RWTexture2D<float4> RenderTarget : register(u0);
 
 cbuffer RayGenCB : register(b0)
@@ -12,6 +20,10 @@ cbuffer RayGenCB : register(b0)
     int use_ray_binning;
     int ao_samples;
     float ao_radius;
+    uint load_ray_from_buffer;
+    uint buffer_w;
+    uint buffer_h;
+    uint buffer_d;  // depth
 };
 
 float3 TransformPosition(float4x4 m, float3 x)
