@@ -102,7 +102,8 @@ std::map<std::string, CamParams> CAM_PARAMS = {
     {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
     {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
     {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}},
-    {"VictorStones", {glm::vec3(54.20388, -360.680725, 20.8701935), glm::vec3(93.000, -316.9831, 29.51616), glm::vec3(0, 0, 1), true}}
+    {"VictorStones", {glm::vec3(54.20388, -360.680725, 20.8701935), glm::vec3(93.000, -316.9831, 29.51616), glm::vec3(0, 0, 1), true}},
+    {"AncientGame", {glm::vec3(-290.0213013, 230.9532928, 341.0099792), glm::vec3(-344.7103882, 227.3368835, 347.0361633), glm::vec3(0,0,1), true}}
 };
 
 struct Vertex
@@ -2628,15 +2629,32 @@ void ReadPixBufferDump(const char* filename)
         uint32_t   ray_flags;
     };
 
-    for (uint32_t i = 0; i < fsize / sizeof(RayInPixBufferDump); i++)
+    std::vector<RayInPixBufferDump> rays_in_pix;
+    const uint32_t                  num_rays = fsize / sizeof(RayInPixBufferDump);
+
+    for (uint32_t i = 0; i < num_rays; i++)
     {
         RayInPixBufferDump r{};
         fread_s(&r, sizeof(r), sizeof(r), 1, f);
+        rays_in_pix.push_back(r);
+    }
+
+    auto cmp = [&](const RayInPixBufferDump& a, const RayInPixBufferDump& b) {
+        auto key_a = std::tie(a.dispatch_rays_idx.z, a.dispatch_rays_idx.y, a.dispatch_rays_idx.x);
+        auto key_b = std::tie(b.dispatch_rays_idx.z, b.dispatch_rays_idx.y, b.dispatch_rays_idx.x);
+        return key_a < key_b;
+    };
+
+    std::sort(rays_in_pix.begin(), rays_in_pix.end(), cmp);
+
+    for (uint32_t i = 0; i < num_rays; i++)
+    {
+        const auto&             r = rays_in_pix[i];
         RayInPixDumpFileMinimal r1{};
-        r1.origin = r.origin;
-        r1.direction = r.direction;
-        r1.tcurrent  = r.tcurrent;
-        r1.tmin      = r.tmin;
+        r1.origin                    = r.origin;
+        r1.direction                 = r.direction;
+        r1.tcurrent                  = r.tcurrent;
+        r1.tmin                      = r.tmin;
         g_ray_in_pix_dispatch_dims.x = std::max(g_ray_in_pix_dispatch_dims.x, r.dispatch_rays_idx.x + 1);
         g_ray_in_pix_dispatch_dims.y = std::max(g_ray_in_pix_dispatch_dims.y, r.dispatch_rays_idx.y + 1);
         g_ray_in_pix_dispatch_dims.z = std::max(g_ray_in_pix_dispatch_dims.z, r.dispatch_rays_idx.z + 1);

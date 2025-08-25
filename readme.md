@@ -4,6 +4,8 @@
 
 Draws an RRA file using DXR. Currently, DXR 1.0 is used. Tested on Radeon 660M.
 
+It can also load rays dumped from PIX's "DXR Invocation" tab. In this case, the rays will be sorted by their thread IDs and filled into the render canvas.
+
 ![3DMark Solar Bay Screenshot](imgs/screenshot.png)
 
 ## Build
@@ -21,4 +23,4 @@ Draws an RRA file using DXR. Currently, DXR 1.0 is used. Tested on Radeon 660M.
    ```
 
 3. Run
-   Double click `MyRRALoader.exe`
+   `MyRRALoader.exe [-i RRA_FILE_NAME] [-p PIX_DUMP]`
