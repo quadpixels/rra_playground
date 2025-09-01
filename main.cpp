@@ -163,6 +163,7 @@ D3D12_VERTEX_BUFFER_VIEW g_fsquad_vbv;
 glm::mat4 g_inv_view;
 glm::mat4 g_inv_proj;
 bool      g_invert_y = false;
+bool      g_set_steady_power_state = false;
 
 ID3D12DescriptorHeap* g_rtv_heap;
 ID3D12DescriptorHeap* g_srv_uav_cbv_heap;
@@ -417,6 +418,10 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
         case GLFW_KEY_ESCAPE:
         {
+            if (g_set_steady_power_state)
+            {
+                g_device12->SetStablePowerState(false);
+            }
             exit(0);
             break;
         }
@@ -619,6 +624,11 @@ void InitDeviceAndCommandQ()
     g_fence_value = 1;
     g_fence_event = CreateEvent(nullptr, false, false, L"Fence");
     g_command_queue->SetName(L"Command Queue");
+
+    if (g_set_steady_power_state)
+    {
+        CE(g_device12->SetStablePowerState(true));
+    }
 }
 
 void InitSwapChain()
@@ -2697,6 +2707,11 @@ int main(int argc, char** argv)
         {
             ReadPixBufferDump(argv[i + 1]);
             i++;
+        }
+        else if (!strcmp(argv[i], "-setsteadypowerstate") ||
+                 !strcmp(argv[i], "-setstablepowerstate"))
+        {
+            g_set_steady_power_state = true;
         }
     }
 

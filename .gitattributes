@@ -2,3 +2,7 @@
 dxcompiler.dll filter=lfs diff=lfs merge=lfs -text
 dxil.dll filter=lfs diff=lfs merge=lfs -text
 glfw3.dll filter=lfs diff=lfs merge=lfs -text
+3DMarkDXRFeatureTest-20241023-121120.rra filter=lfs diff=lfs merge=lfs -text
+3DMarkPortRoyal-20241023-121950.rra filter=lfs diff=lfs merge=lfs -text
+Cyberpunk2077-20241027-163207.rra filter=lfs diff=lfs merge=lfs -text
+b1-Win64-Shipping-20250128-153608.rra filter=lfs diff=lfs merge=lfs -text
