@@ -15,8 +15,8 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 
-#include <glm/glm/glm.hpp>
-#include <glm/glm/gtc/matrix_transform.hpp>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -1852,7 +1852,7 @@ void Render()
     }
 }
 
-void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vector<InstanceInfo>& inst_infos)
+void CreateAS(const std::vector<std::vector<glm::vec3>>& vertices, const std::vector<InstanceInfo>& inst_infos)
 {
     std::vector<ID3D12Resource*> blases;
     std::vector<ID3D12Resource*> transform_buffers;
@@ -1861,16 +1861,16 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     ID3D12Resource*                             tlas_insts;
 
     // Overall vertices and offsets
-    std::vector<Vertex> all_verts;
-    std::vector<int>    blas_offsets, inst_offsets;
+    std::vector<glm::vec3> all_verts;
+    std::vector<int>       blas_offsets, inst_offsets;
 
     for (uint32_t i_blas = 0; i_blas < vertices.size(); i_blas++)
     {
-        ID3D12Resource*            verts_buf;
-        size_t                     num_verts = vertices[i_blas].size();
-        const std::vector<Vertex>* verts     = &(vertices[i_blas]);
+        ID3D12Resource*               verts_buf;
+        size_t                        num_verts = vertices[i_blas].size();
+        const std::vector<glm::vec3>* verts     = &(vertices[i_blas]);
 
-        std::vector<Vertex> dummy = {{{0, 0, 0}}, {{0, 1, 0}}, {{1, 0, 0}}};
+        std::vector<glm::vec3> dummy = {{0, 0, 0}, {0, 1, 0}, {1, 0, 0}};
 
         if (num_verts < 1)  // FIXME: Why does BLAS[0] have 0 vertices
         {
@@ -1878,7 +1878,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
             verts     = &dummy;
         }
 
-        size_t verts_size = sizeof(Vertex) * num_verts;
+        size_t verts_size = sizeof(glm::vec3) * num_verts;
 
         blas_offsets.push_back(all_verts.size());
         all_verts.insert(all_verts.end(), verts->begin(), verts->end());
@@ -1917,7 +1917,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         D3D12_RAYTRACING_GEOMETRY_DESC geom_desc{};
         geom_desc.Type                                 = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
         geom_desc.Triangles.VertexBuffer.StartAddress  = verts_buf->GetGPUVirtualAddress();
-        geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
+        geom_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(glm::vec3);
         geom_desc.Triangles.VertexCount                = num_verts;
         geom_desc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
         geom_desc.Triangles.IndexBuffer                = 0;
@@ -2209,59 +2209,85 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 
 void LoadCubeAndCreateAS()
 {
-    std::vector<std::vector<Vertex>> verts = {{// Front face
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{1.0, -1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
+    const float                         L     = 4.0f;
+    std::vector<glm::vec3> verts0 = {// Front face
+                                                   {-L, -1.0, 1.0},
+                                                   {L, -1.0, 1.0},
+                                                   {L, 1.0, 1.0},
 
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{-1.0, 1.0, 1.0}},
+                                                   {-L, -1.0, 1.0},
+                                                   {L, 1.0, 1.0},
+                                                   {-L, 1.0, 1.0},
 
-                                               // Back face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
+                                                   // Back face
+                                                   {-L, -1.0, -1.0},
+                                                   {-L, 1.0, -1.0},
+                                                   {L, 1.0, -1.0},
 
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
-                                               {{1.0, -1.0, -1.0}},
+                                                   {-L, -1.0, -1.0},
+                                                   {L, 1.0, -1.0},
+                                                   {L, -1.0, -1.0},
 
-                                               // Top face
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
+                                                   // Top face
+                                                   {-L, 1.0, -1.0},
+                                                   {-L, 1.0, 1.0},
+                                                   {L, 1.0, 1.0},
 
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{1.0, 1.0, -1.0}},
+                                                   {-L, 1.0, -1.0},
+                                                   {L, 1.0, 1.0},
+                                                   {L, 1.0, -1.0},
 
-                                               // Bottom face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, 1.0}},
+                                                   // Bottom face
+                                                   {-L, -1.0, -1.0},
+                                                   {L, -1.0, -1.0},
+                                                   {L, -1.0, 1.0},
 
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, 1.0}},
-                                               {{-1.0, -1.0, 1.0}},
+                                                  {-L, -1.0, -1.0},
+                                                  {L, -1.0, 1.0},
+                                                  {-L, -1.0, 1.0},
 
-                                               // Right face
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
+                                                  // Right face
+                                                  {L, -1.0, -1.0},
+                                                  {L, 1.0, -1.0},
+                                                  {L, 1.0, 1.0},
 
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{1.0, -1.0, 1.0}},
+                                                  {L, -1.0, -1.0},
+                                                  {L, 1.0, 1.0},
+                                                  {L, -1.0, 1.0},
 
-                                               // Left face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{-1.0, 1.0, 1.0}},
+                                                  // Left face
+                                                  {-L, -1.0, -1.0},
+                                                  {-L, -1.0, 1.0},
+                                                  {-L, 1.0, 1.0},
 
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-                                               {{-1.0, 1.0, -1.0}}}};
+                                                  {-L, -1.0, -1.0},
+                                                  {-L, 1.0, 1.0},
+                                                  {-L, 1.0, -1.0}
+    };
+
+    std::vector<std::vector<glm::vec3>> verts(1);
+    for (int i = -1; i <= 1; i++)
+    {
+        for (uint32_t vi = 0; vi < verts0.size(); vi++)
+        {
+            glm::vec3 v = verts0[vi];
+            v.x += i * L;
+            verts[0].push_back(v);
+        }
+    }
+
+    // Transform by 45 degrees
+    glm::mat4 s(1.0f);
+    glm::mat4 rot = glm::rotate(s, glm::radians(45.0f), glm::normalize(glm::vec3(0.0f, 0.0f, 1.0f)));
+    for (uint32_t gidx = 0; gidx < verts.size(); gidx++)
+    {
+        auto& vs = verts.at(gidx);
+        for (uint32_t vidx = 0; vidx < vs.size(); vidx++)
+        {
+            glm::vec4 tr = rot * glm::vec4(vs[vidx], 1.0f);
+            vs[vidx]     = glm::vec3(tr);
+        }
+    }
 
     InstanceInfo info{};
     info.blas_idx      = 0;
@@ -2277,7 +2303,7 @@ void LoadCubeAndCreateAS()
     CreateAS(verts, infos);
 
     // Set Camera
-    glm::vec3 eye(2, 2, 5);
+    glm::vec3 eye(0, 0, 5);
     glm::vec3 center(0, 0, 0);
     glm::vec3 up(0, 1, 0);
 
@@ -2347,7 +2373,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
     std::vector<InstanceInfo> tlas0_inst_infos;
 
     // BLAS's vertices
-    std::vector<std::vector<Vertex>> vertices;
+    std::vector<std::vector<glm::vec3>> vertices;
     uint32_t                         tot_tri_count{0};
 
     // Rays
@@ -2376,7 +2402,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
 
         for (unsigned i = 0; i <= blas_count; i++)
         {
-            std::vector<Vertex> geom_verts;
+            std::vector<glm::vec3> geom_verts;
 
             uint32_t cnt{}, cnt1{}, cnt2{}, cnt3{};
             uint64_t addr;
@@ -2446,9 +2472,9 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                             num_tris += tc;
                             if (tc >= 1)
                             {
-                                geom_verts.push_back({{v[0].x, v[0].y, v[0].z}});
-                                geom_verts.push_back({{v[1].x, v[1].y, v[1].z}});
-                                geom_verts.push_back({{v[2].x, v[2].y, v[2].z}});
+                                geom_verts.push_back({v[0].x, v[0].y, v[0].z});
+                                geom_verts.push_back({v[1].x, v[1].y, v[1].z});
+                                geom_verts.push_back({v[2].x, v[2].y, v[2].z});
                                 // printf("Tri1:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n",
                                 //     v[0].x, v[0].y, v[0].z,
                                 //     v[1].x, v[1].y, v[1].z,
@@ -2458,9 +2484,9 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                             // Note the winding direction of this one.
                             if (tc >= 2)
                             {
-                                geom_verts.push_back({{v[1].x, v[1].y, v[1].z}});
-                                geom_verts.push_back({{v[3].x, v[3].y, v[3].z}});
-                                geom_verts.push_back({{v[2].x, v[2].y, v[2].z}});
+                                geom_verts.push_back({v[1].x, v[1].y, v[1].z});
+                                geom_verts.push_back({v[3].x, v[3].y, v[3].z});
+                                geom_verts.push_back({v[2].x, v[2].y, v[2].z});
                             }
                         }
 
@@ -2536,11 +2562,11 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                         instance_infos[iidx] = ii;
 
                         // Refresh the scene's AABB
-                        std::vector<Vertex>& verts = vertices.at(ii.blas_idx);
-                        for (const Vertex& v : verts)
+                        std::vector<glm::vec3>& verts = vertices.at(ii.blas_idx);
+                        for (const glm::vec3& v : verts)
                         {
                             DirectX::XMFLOAT3 vt{};
-                            DirectX::XMFLOAT3 p = v.position;
+                            DirectX::XMFLOAT3 p  = {v.x, v.y, v.z};
                             float*             t = ii.transform;
                             vt.x                 = t[3] + t[0] * p.x + t[1] * p.y + t[2] * p.z;
                             vt.y                 = t[7] + t[4] * p.x + t[5] * p.y + t[6] * p.z;
