@@ -104,7 +104,7 @@ std::map<std::string, CamParams> CAM_PARAMS = {
     {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}},
     {"VictorStones", {glm::vec3(54.20388, -360.680725, 20.8701935), glm::vec3(93.000, -316.9831, 29.51616), glm::vec3(0, 0, 1), true}},
     {"AncientGame", {glm::vec3(-290.0213013, 230.9532928, 341.0099792), glm::vec3(-344.7103882, 227.3368835, 347.0361633), glm::vec3(0,0,1), true}},
-    {"ThreeTriangles", {glm::vec3(60.1231461, 90.5544434, 25.7323875), glm::vec3(60.0977364, 86.9188461, 25.4270802), glm::vec3(0, 0, 1), true}}
+    {"hairball", {glm::vec3(0, 0, -4), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0), true}}
 };
 
 struct Vertex
