@@ -34,6 +34,7 @@
 #include "public/rra_tlas.h"
 #include "public/rra_trace_loader.h"
 #include "public/rra_ray_history.h"
+#include "../frontend/version.h"
 
 #undef min
 #undef max
@@ -2444,7 +2445,7 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                     {
                         n2v.push_back(ch);
                     }
-                    else if (RraBvhIsTriangleNode(ch))
+                    else if (RraBlasIsTriangleNode(i, ch))
                     {
                         float sa{};
                         RraBlasGetSurfaceArea(i, ch, &sa);
@@ -2460,42 +2461,18 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
                         }
                         assert(tc < 3);
 
-                        std::vector<VertexPosition> v;
-                        v.resize(tc == 1 ? 3 : 4);
-                        if (RraBlasGetNodeVertices(i, ch, v.data()) != kRraOk)
-                        {
-                            continue;
-                        }
+                        std::vector<TriangleVertices> triangles(8);
+                        assert(RraBlasGetNodeTriangles(i, ch, triangles.data()) == kRraOk);
 
                         if (sa > 0)
                         {
                             num_tris += tc;
-                            if (tc >= 1)
+                            for (uint32_t tri_idx = 0; tri_idx < tc; tri_idx++)
                             {
-                                geom_verts.push_back({v[0].x, v[0].y, v[0].z});
-                                geom_verts.push_back({v[1].x, v[1].y, v[1].z});
-                                geom_verts.push_back({v[2].x, v[2].y, v[2].z});
-                                // printf("Tri1:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n",
-                                //     v[0].x, v[0].y, v[0].z,
-                                //     v[1].x, v[1].y, v[1].z,
-                                //     v[2].x, v[2].y, v[2].z);
-                            }
-
-                            // Note the winding direction of this one.
-                            if (tc >= 2)
-                            {
-                                geom_verts.push_back({v[1].x, v[1].y, v[1].z});
-                                geom_verts.push_back({v[3].x, v[3].y, v[3].z});
-                                geom_verts.push_back({v[2].x, v[2].y, v[2].z});
-                            }
-                        }
-
-                        if (sa <= 0)
-                        {
-                            printf("Tri1:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n", v[0].x, v[0].y, v[0].z, v[1].x, v[1].y, v[1].z, v[2].x, v[2].y, v[2].z);
-                            if (tc >= 2)
-                            {
-                                printf("Tri2:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n", v[1].x, v[1].y, v[1].z, v[3].x, v[3].y, v[3].z, v[2].x, v[2].y, v[2].z);
+                                const TriangleVertices& triangle = triangles.at(tri_idx);
+                                geom_verts.push_back({triangle.a.x, triangle.a.y, triangle.a.z});
+                                geom_verts.push_back({triangle.b.x, triangle.b.y, triangle.b.z});
+                                geom_verts.push_back({triangle.c.x, triangle.c.y, triangle.c.z});
                             }
                         }
                     }
@@ -2522,12 +2499,6 @@ void LoadRRAFileAndCreateAS(const char* rra_file_name)
             uint32_t root_node{};
             RraBvhGetRootNodePtr(&root_node);
             std::deque<uint32_t> n2v = {root_node};
-
-            // for (unsigned j=0; j<=blas_count; j++) {
-            //     uint64_t x{};
-            //     RraTlasGetInstanceCount(i, j, &x) == kRraOk);
-            //     inst_count += x;
-            // }
 
             std::vector<InstanceInfo> instance_infos;
 
@@ -2739,6 +2710,15 @@ int main(int argc, char** argv)
                  !strcmp(argv[i], "-setstablepowerstate"))
         {
             g_set_steady_power_state = true;
+        }
+        else if (!strcmp(argv[i], "--help"))
+        {
+            printf("RRA Playground!\nRRA library version: %d.%d\nRRA build date: %s\nRRA copyright: %s",
+                   PRODUCT_MAJOR_VERSION,
+                   PRODUCT_MINOR_VERSION,
+                   PRODUCT_BUILD_DATE_STRING,
+                   PRODUCT_COPYRIGHT_STRING);
+            exit(0);
         }
     }
 
