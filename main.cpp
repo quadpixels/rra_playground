@@ -104,6 +104,7 @@ struct FrameTimeSlidingWindow
     std::vector<float> samples;
     uint32_t           offset{0};
     float              curr_sum{0};
+    uint32_t           num_populated{0};
     FrameTimeSlidingWindow(uint32_t n)
     {
         samples.resize(n);
@@ -114,11 +115,20 @@ struct FrameTimeSlidingWindow
         curr_sum -= old;
         curr_sum += x;
         samples[offset] = x;
+        if (num_populated < samples.size())
+        {
+            num_populated++;
+        }
         offset          = (offset + 1) % samples.size();
     }
     float GetAverage()
     {
-        return curr_sum / samples.size();
+        return curr_sum / std::max(num_populated, 1U);
+    }
+    void Reset()
+    {
+        num_populated = 0;
+        std::fill(samples.begin(), samples.end(), 0);
     }
 };
 FrameTimeSlidingWindow g_frame_time_sliding_window(60);
@@ -148,7 +158,7 @@ struct Vertex
 struct InstanceInfo
 {
     uint64_t blas_idx{};
-    float    transform[12];  // Row Major
+    float    transform[12]{};  // Row Major
 };
 struct RayGenCB
 {
@@ -243,6 +253,7 @@ int          g_frame_index;
 
 const char* g_rra_file_name;
 std::vector<std::string> g_ray_types = { "Primary", "AO" };
+static int               g_ray_type_idx{0};
 
 enum AppState
 {
@@ -484,10 +495,14 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             g_use_ao = true;
             g_use_ray_binning = false;
+            g_ray_type_idx    = 1;
+            g_frame_time_sliding_window.Reset();
             break;
         }
         case GLFW_KEY_0: {
             g_use_ao = false;
+            g_ray_type_idx = 0;
+            g_frame_time_sliding_window.Reset();
             break;
         }
         case GLFW_KEY_3:
@@ -1485,38 +1500,40 @@ void RenderImGUI(ID3D12GraphicsCommandList4* command_list)
         {
             labels.push_back(s.c_str());
         }
-        static int  ray_type_idx{0};
         static int  last_ray_type_idx{0};
-        const char*  preview_value = labels.at(ray_type_idx);
+        const char*  preview_value = labels.at(g_ray_type_idx);
         char        buf[32];
+        
         snprintf(buf, sizeof(buf), "Ray types (%zu)", labels.size());
         if (ImGui::BeginCombo(buf, preview_value))
         {
             for (uint32_t i = 0; i < g_ray_types.size(); i++)
             {
-                const bool is_selected = (ray_type_idx == i);
+                const bool is_selected = (g_ray_type_idx == i);
                 if (ImGui::Selectable(labels.at(i), is_selected))
                 {
-                    ray_type_idx = i;
+                    g_ray_type_idx = i;
                 }
             }
             ImGui::EndCombo();
         }
 
-        if (ray_type_idx != last_ray_type_idx)
+        if (g_ray_type_idx != last_ray_type_idx)
         {
-            if (ray_type_idx == 0)  // primary
+            if (g_ray_type_idx == 0)  // primary
             {
                 g_use_ao = false;
+                g_frame_time_sliding_window.Reset();
             }
-            else if (ray_type_idx == 1)  // ao
+            else if (g_ray_type_idx == 1)  // ao
             {
                 g_use_ao          = true;
                 g_use_ray_binning = false;
+                g_frame_time_sliding_window.Reset();
             }
         }
 
-        last_ray_type_idx = ray_type_idx;
+        last_ray_type_idx = g_ray_type_idx;
     }
 
     static bool last_set_steady_power_state{false};
@@ -2100,11 +2117,9 @@ void CreateAS(const std::vector<std::vector<glm::vec3>>& vertices, const std::ve
         CE(g_device12->CreateCommittedResource(
             &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&verts_buf)));
         char*       mapped{nullptr};
-        D3D12_RANGE read_range{};
-        read_range.Begin = 0;
-        read_range.End   = 0;
-        verts_buf->Map(0, &read_range, (void**)(&mapped));
+        verts_buf->Map(0, nullptr, (void**)(&mapped));
         memcpy(mapped, verts->data(), verts_size);
+        printf(">>>> %g,%g,%g\n", verts->at(0).x, verts->at(0).y, verts->at(0).z);
         verts_buf->Unmap(0, nullptr);
         verts_buf->SetName(L"Verts Buf BLAS");
 
@@ -2611,7 +2626,6 @@ LoadGeometryFromRRAFileAndCreateAS()
         for (unsigned i = 0; i <= blas_count; i++)
         {
             g_app_current_progress = 1.0f * i / blas_count;
-            printf("%g\n", g_app_current_progress);
             std::vector<glm::vec3> geom_verts;
 
             uint32_t cnt{}, cnt1{}, cnt2{}, cnt3{};
@@ -2671,7 +2685,10 @@ LoadGeometryFromRRAFileAndCreateAS()
                         assert(tc < 3);
 
                         std::vector<TriangleVertices> triangles(8);
-                        assert(RraBlasGetNodeTriangles(i, ch, triangles.data()) == kRraOk);
+                        if (RraBlasGetNodeTriangles(i, ch, triangles.data()) != kRraOk)
+                        {
+                            continue;
+                        }
 
                         if (sa > 0)
                         {
