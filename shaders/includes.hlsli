@@ -10,6 +10,8 @@ RaytracingAccelerationStructure Scene : register(t0, space0);
 StructuredBuffer<float3> Vertices : register(t1);
 StructuredBuffer<int> InstanceVertOffsets : register(t2);
 StructuredBuffer<RayInPixBufferMinimal> RaysInPixBufferMinimal : register(t3);
+StructuredBuffer<uint> RayEntryOffsets : register(t4);
+
 RWTexture2D<float4> RenderTarget : register(u0);
 
 cbuffer RayGenCB : register(b0)
@@ -24,6 +26,7 @@ cbuffer RayGenCB : register(b0)
     uint buffer_w;
     uint buffer_h;
     uint buffer_d;  // depth
+    uint ray_flag;
 };
 
 float3 TransformPosition(float4x4 m, float3 x)

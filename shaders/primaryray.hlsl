@@ -1,5 +1,7 @@
 #include "includes.hlsli"
 
+// Hey
+
 struct Attributes
 {
     float2 bary;
@@ -27,19 +29,66 @@ void RayGen()
     bool should_skip = false;
     RayDesc ray;
 
-    if (load_ray_from_buffer > 0)
+    if (load_ray_from_buffer & 1)
     {
+        uint tidx, iidx;  // Thread idx and invocation idx
+        bool reflow = (load_ray_from_buffer & 0x2);
         const uint2 dixy = DispatchRaysIndex().xy;
-        const uint2 ddxy = DispatchRaysDimensions().xy;
-        const uint tidx = dixy.x + dixy.y * ddxy.x;
+        
         const uint l = buffer_w * buffer_h * buffer_d;
-        if (tidx < l)
+        
+        if (reflow)
         {
-            RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[tidx];
-            ray.Origin = rpbm.origin;
-            ray.Direction = rpbm.direction;
-            ray.TMin = rpbm.tmin;
-            ray.TMax = 100000.0;
+            const uint2 ddxy = DispatchRaysDimensions().xy;
+            iidx = dixy.x + dixy.y * ddxy.x;
+        }
+        else
+        {
+            if (dixy.x >= buffer_w || dixy.y >= buffer_h)
+            {
+                iidx = l;
+            }
+            else
+            {
+                iidx = dixy.x + dixy.y * buffer_w;
+            }
+        }
+        
+        if (iidx < l)
+        {
+            uint rayidx_lb, rayidx_ub;
+            if (iidx == 0)
+            {
+                rayidx_lb = 0;
+                rayidx_ub = RayEntryOffsets[0];
+            }
+            else
+            {
+                rayidx_lb = RayEntryOffsets[iidx - 1];
+                rayidx_ub = RayEntryOffsets[iidx];
+            }
+            
+            uint nr = rayidx_ub - rayidx_lb;
+            
+            if (nr > 0)
+            {
+                ret = float4(0, 0, 0, 0);   
+                for (uint rayidx = rayidx_lb; rayidx < rayidx_ub; rayidx++)
+                {
+                    RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[rayidx];
+                    ray.Origin = rpbm.origin;
+                    ray.Direction = rpbm.direction;
+                    ray.TMin = rpbm.tmin;
+                    ray.TMax = 100000.0;
+                
+                    HitInfo payload = { float4(0, 0, 0, 1) };
+                    TraceRay(Scene,
+                    ray_flag,
+                    0xFF, 0, 0, 0, ray, payload);
+                    ret += payload.colorAndDistance;
+                }
+                ret /= (nr) * 1.0;
+            }
         }
         else
         {
@@ -56,16 +105,14 @@ void RayGen()
         ray.Direction = TransformDirection(inverse_view, normalize(target));
         ray.TMin = 0.001;
         ray.TMax = 10000.0;
-    }
-    
-    if (should_skip == false)
-    {
+        
         HitInfo payload = { float4(0, 0, 0, 1) };
         TraceRay(Scene,
-            RAY_FLAG_NONE,
-            0xFF, 0, 0, 0, ray, payload);
+        ray_flag,
+        0xFF, 0, 0, 0, ray, payload);
         ret = payload.colorAndDistance;
     }
+    
     RenderTarget[DispatchRaysIndex().xy] = ret;
 }
 

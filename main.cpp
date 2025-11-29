@@ -58,9 +58,20 @@ struct RayInPixDumpFileMinimal
     float      tcurrent;
     //uint32_t   ray_flags;
 };
-std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
-glm::uvec3                         g_ray_in_pix_dispatch_dims;
+//std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
+//glm::uvec3                         g_ray_in_pix_dispatch_dims;
 bool                               g_use_ray_in_pix{false};
+
+struct DispatchRaysInfo
+{
+    std::vector<RayInPixDumpFileMinimal> rays;
+    std::vector<uint32_t>                ray_idxes;
+    glm::uvec3                           dispatch_dims;
+    std::string                          name;
+    uint32_t                             num_invocations{};
+};
+std::vector<DispatchRaysInfo> g_dispatch_rays_info;
+bool                          g_dispatch_rays_info_reflow{false};
 
 struct FrameTime
 {
@@ -99,19 +110,20 @@ struct FrameTime
 
 FrameTime g_frame_time;
 
-struct FrameTimeSlidingWindow
+template<class T>
+struct MySlidingWindow
 {
-    std::vector<float> samples;
-    uint32_t           offset{0};
-    float              curr_sum{0};
-    uint32_t           num_populated{0};
-    FrameTimeSlidingWindow(uint32_t n)
+    std::vector<T> samples;
+    uint32_t       offset{0};
+    T              curr_sum{0};
+    uint32_t       num_populated{0};
+    MySlidingWindow(uint32_t n)
     {
         samples.resize(n);
     }
-    void AddSample(float x)
+    void AddSample(T x)
     {
-        float old       = samples[offset];
+        T old     = samples[offset];
         curr_sum -= old;
         curr_sum += x;
         samples[offset] = x;
@@ -123,15 +135,16 @@ struct FrameTimeSlidingWindow
     }
     float GetAverage()
     {
-        return curr_sum / std::max(num_populated, 1U);
+        return curr_sum * 1.0 / std::max(num_populated, 1U);
     }
     void Reset()
     {
         num_populated = 0;
+        curr_sum      = 0;
         std::fill(samples.begin(), samples.end(), 0);
     }
 };
-FrameTimeSlidingWindow g_frame_time_sliding_window(60);
+MySlidingWindow<float> g_frame_time_sliding_window(60);
 
 struct CamParams
 {
@@ -168,10 +181,11 @@ struct RayGenCB
     int               use_ray_binning;
     int               ao_samples;
     float             ao_radius;
-    uint32_t          load_ray_from_buffer;
+    uint32_t          load_ray_from_buffer;  // bit[0]: yes/no; bit[1]: Reflow or not
     uint32_t          buffer_w;
     uint32_t          buffer_h;
     uint32_t          buffer_d;
+    uint32_t          ray_flag;
 };
 
 int WIN_W = 1280, WIN_H = 720;
@@ -241,6 +255,8 @@ ID3D12Resource*  g_query_readback_buffer;
 
 ID3D12Resource* g_rays_in_pix_buffer;
 ID3D12Resource* g_rays_in_pix_buffer_upload;
+ID3D12Resource* g_raydump_ray_idxes;
+ID3D12Resource* g_raydump_ray_idxes_upload;
 
 bool g_use_ao{false};
 int g_use_ray_binning{0};
@@ -251,9 +267,37 @@ int          g_fence_value;
 HANDLE       g_fence_event;
 int          g_frame_index;
 
+// UI-related
 const char* g_rra_file_name;
 std::vector<std::string> g_ray_types = { "Primary", "AO" };
 static int               g_ray_type_idx{0};
+bool                     g_rayflag_accept_first_hit_and_end_search{false};
+
+DispatchRaysInfo* GetCurrentDispatchRaysInfo()
+{
+    if (g_ray_type_idx >= 2)
+        return &(g_dispatch_rays_info[g_ray_type_idx - 2]);
+    else
+        return nullptr;
+}
+
+glm::uvec3 GetCurrentDispatchRaysDimension()
+{
+    glm::uvec3 ret(0);
+    DispatchRaysInfo* dri = GetCurrentDispatchRaysInfo();
+    if (dri)
+        ret = dri->dispatch_dims;
+    return ret;
+}
+
+float GetCurrentDispatchRaysAvgInvocationPerRay()
+{
+    DispatchRaysInfo* dri = GetCurrentDispatchRaysInfo();
+    if (dri)
+        return 1.0f * dri->num_invocations / dri->ray_idxes.size();
+    else
+        return 0;
+}
 
 enum AppState
 {
@@ -413,69 +457,6 @@ void GlmMat4ToDirectXMatrix(DirectX::XMMATRIX* out, const glm::mat4& m)
     }
 }
 
-IDxcBlob* CompileShaderLibrary(LPCWSTR fileName)
-{
-    static IDxcCompiler*       pCompiler = nullptr;
-    static IDxcLibrary*        pLibrary  = nullptr;
-    static IDxcIncludeHandler* dxcIncludeHandler;
-
-    HRESULT hr;
-
-    // Initialize the DXC compiler and compiler helper
-    if (!pCompiler)
-    {
-        CE(DxcCreateInstance(CLSID_DxcCompiler, __uuidof(IDxcCompiler), reinterpret_cast<void**>(&pCompiler)));
-        CE(DxcCreateInstance(CLSID_DxcLibrary, __uuidof(IDxcLibrary), reinterpret_cast<void**>(&pLibrary)));
-        CE(pLibrary->CreateIncludeHandler(&dxcIncludeHandler));
-    }
-    // Open and read the file
-    std::ifstream shaderFile(fileName);
-    if (shaderFile.good() == false)
-    {
-        throw std::logic_error("Cannot find shader file");
-    }
-    std::stringstream strStream;
-    strStream << shaderFile.rdbuf();
-    std::string sShader = strStream.str();
-
-    // Create blob from the string
-    IDxcBlobEncoding* pTextBlob;
-    CE(pLibrary->CreateBlobWithEncodingFromPinned(LPBYTE(sShader.c_str()), static_cast<uint32_t>(sShader.size()), 0, &pTextBlob));
-
-    // Compile
-    IDxcOperationResult* pResult;
-    const wchar_t*       args[] = { L"-O3" };
-    CE(pCompiler->Compile(pTextBlob, fileName, L"", L"lib_6_5", args, 1, nullptr, 0, dxcIncludeHandler, &pResult));
-
-    // Verify the result
-    HRESULT resultCode;
-    CE(pResult->GetStatus(&resultCode));
-    if (FAILED(resultCode))
-    {
-        IDxcBlobEncoding* pError;
-        hr = pResult->GetErrorBuffer(&pError);
-        if (FAILED(hr))
-        {
-            throw std::logic_error("Failed to get shader compiler error");
-        }
-
-        // Convert error blob to a string
-        std::vector<char> infoLog(pError->GetBufferSize() + 1);
-        memcpy(infoLog.data(), pError->GetBufferPointer(), pError->GetBufferSize());
-        infoLog[pError->GetBufferSize()] = 0;
-
-        std::string errorMsg = "Shader Compiler Error:\n";
-        errorMsg.append(infoLog.data());
-
-        MessageBoxA(nullptr, errorMsg.c_str(), "Error!", MB_OK);
-        throw std::logic_error("Failed compile shader");
-    }
-
-    IDxcBlob* pBlob;
-    CE(pResult->GetResult(&pBlob));
-    return pBlob;
-}
-
 void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     if (action == GLFW_PRESS)
@@ -495,13 +476,17 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             g_use_ao = true;
             g_use_ray_binning = false;
+            g_use_ray_in_pix  = false;
             g_ray_type_idx    = 1;
+            g_rayflag_accept_first_hit_and_end_search = true;
             g_frame_time_sliding_window.Reset();
             break;
         }
         case GLFW_KEY_0: {
             g_use_ao = false;
+            g_use_ray_in_pix = false;
             g_ray_type_idx = 0;
+            g_rayflag_accept_first_hit_and_end_search = false;
             g_frame_time_sliding_window.Reset();
             break;
         }
@@ -743,6 +728,104 @@ void InitSwapChain()
     CE(g_factory->MakeWindowAssociation(glfwGetWin32Window(g_window), DXGI_MWA_NO_ALT_ENTER));
 }
 
+void CopyDispatchRaysInfoToGPU(const struct DispatchRaysInfo& info)
+{
+    if (g_rays_in_pix_buffer_upload)
+        g_rays_in_pix_buffer_upload->Release();
+    if (g_rays_in_pix_buffer)
+        g_rays_in_pix_buffer->Release();
+    if (g_raydump_ray_idxes)
+        g_raydump_ray_idxes->Release();
+    if (g_raydump_ray_idxes_upload)
+        g_raydump_ray_idxes_upload->Release();
+
+    if (info.rays.size() > 0)
+    {
+        D3D12_HEAP_PROPERTIES props{};
+        props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+        props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        props.CreationNodeMask     = 1;
+        props.VisibleNodeMask      = 1;
+
+        D3D12_HEAP_PROPERTIES props1 = props;
+        props1.Type                  = D3D12_HEAP_TYPE_UPLOAD;
+
+        size_t sz_rays = sizeof(RayInPixDumpFileMinimal) * info.rays.size();
+        size_t sz_ray_idxes = sizeof(uint32_t) * info.ray_idxes.size();
+
+        D3D12_RESOURCE_DESC res_desc{};
+        res_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+        res_desc.Alignment          = 0;
+        res_desc.Height             = 1;
+        res_desc.DepthOrArraySize   = 1;
+        res_desc.MipLevels          = 1;
+        res_desc.Format             = DXGI_FORMAT_UNKNOWN;
+        res_desc.SampleDesc.Count   = 1;
+        res_desc.SampleDesc.Quality = 0;
+        res_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        res_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+        res_desc.Width              = sz_rays;
+        CE(g_device12->CreateCommittedResource(
+            &props1, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer_upload)));
+        CE(g_device12->CreateCommittedResource(
+            &props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer)));
+
+        res_desc.Width = sz_ray_idxes;
+        CE(g_device12->CreateCommittedResource(
+            &props1, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_raydump_ray_idxes_upload)));
+        CE(g_device12->CreateCommittedResource(
+            &props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_raydump_ray_idxes)));
+        g_raydump_ray_idxes->SetName(L"Ray Idxes");
+
+        char* mapped;
+        g_rays_in_pix_buffer_upload->Map(0, nullptr, (void**)(&mapped));
+        memcpy(mapped, info.rays.data(), sz_rays);
+        g_rays_in_pix_buffer_upload->Unmap(0, nullptr);
+
+        g_raydump_ray_idxes_upload->Map(0, nullptr, (void**)(&mapped));
+        memcpy(mapped, info.ray_idxes.data(), sz_ray_idxes);
+        g_raydump_ray_idxes_upload->Unmap(0, nullptr);
+
+        g_command_list1->Reset(g_command_allocator1, nullptr);
+        g_command_list1->CopyResource(g_rays_in_pix_buffer, g_rays_in_pix_buffer_upload);
+        g_command_list1->CopyResource(g_raydump_ray_idxes,  g_raydump_ray_idxes_upload);
+        
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = g_rays_in_pix_buffer;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+        barrier.Transition.Subresource = 0;
+        g_command_list1->ResourceBarrier(1, &barrier);
+        barrier.Transition.pResource = g_raydump_ray_idxes;
+        g_command_list1->ResourceBarrier(1, &barrier);
+
+        g_command_list1->Close();
+        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
+
+        // SRV of RT output resource
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Buffer.FirstElement        = 0;
+        srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+        srv_desc.Buffer.NumElements         = info.rays.size();
+        srv_desc.Buffer.StructureByteStride = sizeof(RayInPixDumpFileMinimal);
+        srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+        srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+        handle.ptr = g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 8 * g_srv_uav_cbv_descriptor_size;
+        g_device12->CreateShaderResourceView(g_rays_in_pix_buffer, &srv_desc, handle);
+        handle.ptr += g_srv_uav_cbv_descriptor_size;
+        srv_desc.Buffer.NumElements         = info.ray_idxes.size();
+        srv_desc.Buffer.StructureByteStride = sizeof(uint32_t);
+        g_device12->CreateShaderResourceView(g_raydump_ray_idxes, &srv_desc, handle);
+
+        WaitForPreviousFrame();
+    }
+}
+
 void InitDX12Stuff()
 {
     CE(g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_command_allocator)));
@@ -813,67 +896,14 @@ void InitDX12Stuff()
 
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 9;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix
+    heap_desc.NumDescriptors = 10;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix, [9]=RayIdxes
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
     g_srv_uav_cbv_heap->SetName(L"SRV UAV CBV heap");
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    
-    if (g_rays_in_pix_dumpfile_minimal.size() > 0)
-    {
-        D3D12_RESOURCE_DESC res_desc{};
-        res_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
-        res_desc.Alignment          = 0;
-        res_desc.Height             = 1;
-        res_desc.DepthOrArraySize   = 1;
-        res_desc.MipLevels          = 1;
-        res_desc.Format             = DXGI_FORMAT_UNKNOWN;
-        res_desc.SampleDesc.Count   = 1;
-        res_desc.SampleDesc.Quality = 0;
-        res_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        res_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
-        res_desc.Width              = sizeof(RayInPixDumpFileMinimal) * g_rays_in_pix_dumpfile_minimal.size();
-        CE(g_device12->CreateCommittedResource(
-            &props1, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer_upload)));
-        CE(g_device12->CreateCommittedResource(
-            &props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer)));
-
-        char* mapped;
-        g_rays_in_pix_buffer_upload->Map(0, nullptr, (void**)(&mapped));
-        memcpy(mapped, g_rays_in_pix_dumpfile_minimal.data(), res_desc.Width);
-        g_rays_in_pix_buffer_upload->Unmap(0, nullptr);
-
-        g_command_list1->Reset(g_command_allocator1, nullptr);
-
-        g_command_list1->CopyResource(g_rays_in_pix_buffer, g_rays_in_pix_buffer_upload);
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource   = g_rays_in_pix_buffer;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-        barrier.Transition.Subresource = 0;
-        g_command_list1->ResourceBarrier(1, &barrier);
-
-        g_command_list1->Close();
-        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
-
-        // SRV of RT output resource
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-        srv_desc.Buffer.FirstElement        = 0;
-        srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
-        srv_desc.Buffer.NumElements         = g_rays_in_pix_dumpfile_minimal.size();
-        srv_desc.Buffer.StructureByteStride = sizeof(RayInPixDumpFileMinimal);
-        srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
-        srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
-
-        D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
-        handle.ptr = g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 8 * g_srv_uav_cbv_descriptor_size;
-        g_device12->CreateShaderResourceView(g_rays_in_pix_buffer, &srv_desc, handle);
-    }
+    //
 
     // Query heap
     D3D12_QUERY_HEAP_DESC qhd{};
@@ -1113,8 +1143,8 @@ void CreateRTPipeline()
 
         // For PIX rays specifically
         D3D12_DESCRIPTOR_RANGE desc_ranges1[1]{};
-        desc_ranges1[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // Verts and InstanceOffsets
-        desc_ranges1[0].NumDescriptors                    = 1;
+        desc_ranges1[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // Rays, offsets
+        desc_ranges1[0].NumDescriptors                    = 2;
         desc_ranges1[0].BaseShaderRegister                = 3;
         desc_ranges1[0].RegisterSpace                     = 0;
         desc_ranges1[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1444,11 +1474,20 @@ void RenderImGUI(ID3D12GraphicsCommandList4* command_list)
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
     
-    ImGui::SetNextWindowSize(ImVec2(320, 200), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 300), ImGuiCond_Once);
     ImGui::SetNextWindowPos(ImVec2(32, 32), ImGuiCond_Once);
 
     ImGui::Begin("RRA Playground.");
     ImGui::Text("Device: %s", g_adapter_name.c_str());
+
+    static bool last_set_steady_power_state{false};
+    ImGui::Checkbox("Steady power state", &g_set_steady_power_state);
+    if (last_set_steady_power_state != g_set_steady_power_state)
+    {
+        CE(g_device12->SetStablePowerState(g_set_steady_power_state));
+    }
+    last_set_steady_power_state = g_set_steady_power_state;
+
     ImGui::Separator();
     switch (g_app_state)
     {
@@ -1459,7 +1498,10 @@ void RenderImGUI(ID3D12GraphicsCommandList4* command_list)
         }
         case AppState::APP_OPENING_RRA_FILE:
         {
-            ImGui::Text("[1/4] Opening RRA File");
+            char buf[300];
+            snprintf(buf, sizeof(buf), "[1/4] Opening %s", g_rra_file_name);
+            ImGui::TextWrapped(buf);
+            ImGui::Spacing();
             break;
         }
         case AppState::APP_READ_DISPATCHES:
@@ -1490,6 +1532,7 @@ void RenderImGUI(ID3D12GraphicsCommandList4* command_list)
             char     buf[32];
             snprintf(buf, sizeof(buf), "%.3f ms", g_frame_time_sliding_window.GetAverage() * 1000.0f);
             ImGui::PlotLines(buf, dat, sz, o);
+            ImGui::Separator();
             break;
         }
     }
@@ -1505,44 +1548,68 @@ void RenderImGUI(ID3D12GraphicsCommandList4* command_list)
         char        buf[32];
         
         snprintf(buf, sizeof(buf), "Ray types (%zu)", labels.size());
-        if (ImGui::BeginCombo(buf, preview_value))
-        {
-            for (uint32_t i = 0; i < g_ray_types.size(); i++)
-            {
-                const bool is_selected = (g_ray_type_idx == i);
-                if (ImGui::Selectable(labels.at(i), is_selected))
-                {
-                    g_ray_type_idx = i;
-                }
-            }
-            ImGui::EndCombo();
-        }
+        ImGui::Text(buf);
+        ImGui::ListBox("##listbox1", &g_ray_type_idx, labels.data(), labels.size(), 4);
+        
+        static bool is_using_dumped_rays = false;
 
         if (g_ray_type_idx != last_ray_type_idx)
         {
             if (g_ray_type_idx == 0)  // primary
             {
                 g_use_ao = false;
+                g_use_ray_in_pix = false;
+                g_rayflag_accept_first_hit_and_end_search = false;
                 g_frame_time_sliding_window.Reset();
             }
             else if (g_ray_type_idx == 1)  // ao
             {
                 g_use_ao          = true;
                 g_use_ray_binning = false;
+                g_use_ray_in_pix  = false;
+                g_rayflag_accept_first_hit_and_end_search = true;
                 g_frame_time_sliding_window.Reset();
+            }
+            else
+            {
+                uint32_t ray_dump_idx = g_ray_type_idx - 2;
+                if (ray_dump_idx < g_dispatch_rays_info.size())
+                {
+                    is_using_dumped_rays = true;
+                    CopyDispatchRaysInfoToGPU(g_dispatch_rays_info.at(ray_dump_idx));
+                    g_use_ray_in_pix = true;
+                    g_use_ao         = false;
+                    g_rayflag_accept_first_hit_and_end_search = false;
+                    g_frame_time_sliding_window.Reset();
+                }
             }
         }
 
         last_ray_type_idx = g_ray_type_idx;
-    }
 
-    static bool last_set_steady_power_state{false};
-    ImGui::Checkbox("Steady power state", &g_set_steady_power_state);
-    if (last_set_steady_power_state != g_set_steady_power_state)
-    {
-        CE(g_device12->SetStablePowerState(g_set_steady_power_state));
+        ImGui::Text("Ray flag");
+        ImGui::Checkbox("ACCEPT_FIRST_SEARCH_AND_END_FLAG", &g_rayflag_accept_first_hit_and_end_search);
+
+        if (g_ray_type_idx >= 2 && is_using_dumped_rays)
+        {
+            ImGui::Separator();
+            char buf[100];
+            glm::uvec3 d = GetCurrentDispatchRaysDimension();
+            snprintf(buf, sizeof(buf), "Dim (%u,%u,%u), %.2f invoc/ray", d.x, d.y, d.z, GetCurrentDispatchRaysAvgInvocationPerRay());
+            ImGui::Text(buf);
+            static int dr_layout{1};  // Do not reflow by default
+            static int last_dr_layout;
+            snprintf(buf, sizeof(buf), "Reflow to %ux%u", WIN_W, WIN_H);
+            ImGui::RadioButton(buf, &dr_layout, 0);
+            ImGui::RadioButton("Original dimension", &dr_layout, 1);
+
+            if (last_dr_layout != dr_layout)
+            {
+                g_dispatch_rays_info_reflow = (dr_layout == 0);
+            }
+            last_dr_layout = dr_layout;
+        }
     }
-    last_set_steady_power_state = g_set_steady_power_state;
 
     ImGui::End();
 
@@ -1576,9 +1643,17 @@ void Render()
     cb.use_ray_binning = g_use_ray_binning;
     cb.ao_radius       = g_ao_radius;
     cb.load_ray_from_buffer = g_use_ray_in_pix;
-    cb.buffer_w             = g_ray_in_pix_dispatch_dims.x;
-    cb.buffer_h             = g_ray_in_pix_dispatch_dims.y;
-    cb.buffer_d             = g_ray_in_pix_dispatch_dims.z;
+    if (g_dispatch_rays_info_reflow && g_use_ray_in_pix)
+        cb.load_ray_from_buffer |= 0x2;
+    glm::uvec3 dd           = GetCurrentDispatchRaysDimension();
+    cb.buffer_w             = dd.x;
+    cb.buffer_h             = dd.y;
+    cb.buffer_d             = dd.z;
+    cb.ray_flag             = 0;
+    if (g_rayflag_accept_first_hit_and_end_search)
+    {
+        cb.ray_flag |= D3D12_RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+    }
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 
@@ -2119,7 +2194,6 @@ void CreateAS(const std::vector<std::vector<glm::vec3>>& vertices, const std::ve
         char*       mapped{nullptr};
         verts_buf->Map(0, nullptr, (void**)(&mapped));
         memcpy(mapped, verts->data(), verts_size);
-        printf(">>>> %g,%g,%g\n", verts->at(0).x, verts->at(0).y, verts->at(0).z);
         verts_buf->Unmap(0, nullptr);
         verts_buf->SetName(L"Verts Buf BLAS");
 
@@ -2815,11 +2889,18 @@ void LoadDispatchesFromRRAFile()
         uint32_t tot_ray_count = 0;
         const uint32_t tot_dim       = x * y * z;
         uint32_t       tot_thd_count = 0;
-        for (uint32_t tx = 0; tx < x; tx++)
+        std::vector<Ray> all_rays;
+        DispatchRaysInfo dri{};
+        dri.dispatch_dims.x = x;
+        dri.dispatch_dims.y = y;
+        dri.dispatch_dims.z = z;
+        dri.num_invocations = 0;
+
+        for (uint32_t tz = 0; tz < z; tz++)
         {
             for (uint32_t ty = 0; ty < y; ty++)
             {
-                for (uint32_t tz = 0; tz < z; tz++)
+                for (uint32_t tx = 0; tx < x; tx++)
                 {
                     GlobalInvocationID gid = {tx, ty, tz};
                     uint32_t           c{0};
@@ -2827,15 +2908,41 @@ void LoadDispatchesFromRRAFile()
                     {
                         continue;
                     }
+                    std::vector<Ray> rays(c);
+                    if (RraRayGetRays(d, gid, rays.data()) != kRraOk)
+                    {
+                        continue;
+                    }
                     tot_ray_count += c;
                     tot_thd_count++;
                     g_app_current_progress = tot_thd_count * 1.0f / tot_dim;
+
+                    dri.num_invocations += c;
+                    for (uint32_t i = 0; i < c; i++)
+                    {
+                        const Ray&              r = rays.at(i);
+                        RayInPixDumpFileMinimal rd{};
+                        rd.origin.x = r.origin[0];
+                        rd.origin.y = r.origin[1];
+                        rd.origin.z = r.origin[2];
+                        rd.direction.x = r.direction[0];
+                        rd.direction.y = r.direction[1];
+                        rd.direction.z = r.direction[2];
+                        rd.tmin        = r.t_min;
+                        rd.tcurrent    = r.t_max;
+                        dri.rays.push_back(rd);
+                    }
+                    dri.ray_idxes.push_back(dri.rays.size());
                 }
             }
         }
         printf("  dispatch[%u], dim=(%u,%u,%u), %u rays (%g/thd)\n", d, x, y, z, tot_ray_count, tot_ray_count * 1.0 / x / y / z);
 
-        g_ray_types.push_back("RRA DispatchRays " + std::to_string(d));
+        char buf[100];
+        snprintf(buf, sizeof(buf), "DispatchRays[%u] (%u,%u,%u)", d, x, y, z);
+        g_ray_types.push_back(std::string(buf));
+        dri.name = std::string(buf);
+        g_dispatch_rays_info.push_back(dri);
     }
 }
 
@@ -2884,7 +2991,8 @@ void CreateASAndSetupCamera(const std::vector<InstanceInfo>& tlas0_inst_infos,  
 
 void ReadPixBufferDump(const char* filename)
 {
-    g_rays_in_pix_dumpfile_minimal.clear();
+    DispatchRaysInfo dri{};
+
     printf("Will print a pix buffer dump, named %s\n", filename);
     std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
     if (!ifs.good())
@@ -2936,14 +3044,21 @@ void ReadPixBufferDump(const char* filename)
         r1.direction                 = r.direction;
         r1.tcurrent                  = r.tcurrent;
         r1.tmin                      = r.tmin;
-        g_ray_in_pix_dispatch_dims.x = std::max(g_ray_in_pix_dispatch_dims.x, r.dispatch_rays_idx.x + 1);
-        g_ray_in_pix_dispatch_dims.y = std::max(g_ray_in_pix_dispatch_dims.y, r.dispatch_rays_idx.y + 1);
-        g_ray_in_pix_dispatch_dims.z = std::max(g_ray_in_pix_dispatch_dims.z, r.dispatch_rays_idx.z + 1);
-        g_rays_in_pix_dumpfile_minimal.push_back(r1);
+        dri.dispatch_dims.x          = std::max(dri.dispatch_dims.x, r.dispatch_rays_idx.x + 1);
+        dri.dispatch_dims.y          = std::max(dri.dispatch_dims.y, r.dispatch_rays_idx.y + 1);
+        dri.dispatch_dims.z          = std::max(dri.dispatch_dims.z, r.dispatch_rays_idx.z + 1);
+        dri.rays.push_back(r1);
+        dri.ray_idxes.push_back(dri.rays.size());
     }
+    dri.num_invocations = num_rays;
 
     fclose(f);
-    printf("Read %zu rays\n", g_rays_in_pix_dumpfile_minimal.size());
+    printf("Read %zu rays\n", dri.rays.size());
+
+    g_dispatch_rays_info.push_back(dri);
+    char buf[100];
+    snprintf(buf, sizeof(buf), "PixDump (%u,%u,%u)", dri.dispatch_dims.x, dri.dispatch_dims.y, dri.dispatch_dims.z);
+    g_ray_types.push_back(std::string(buf));
 }
 
 // Stolen from https://github.com/ocornut/imgui/blob/master/examples/example_win32_directx12/main.cpp
@@ -3106,6 +3221,7 @@ int main(int argc, char** argv)
             auto [ tlas0_inst_infos, vertices ] = LoadGeometryFromRRAFileAndCreateAS();
             CreateASAndSetupCamera(tlas0_inst_infos, vertices);
             g_app_state = AppState::APP_RENDERING;
+            g_frame_time_sliding_window.Reset();
         }
         else
         {

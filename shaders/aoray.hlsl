@@ -119,7 +119,7 @@ void RayGen_ao()
             ray.Direction = RayDirs[idx];
         }
         HitInfo_primary payload = { -1 };
-        TraceRay(Scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, 0, 0, 0, ray, payload);
+        TraceRay(Scene, ray_flag, 0xFF, 0, 0, 0, ray, payload);
         if (payload.tHit > 0)
         {
             ao++;
