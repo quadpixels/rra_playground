@@ -29,22 +29,54 @@ include_directories(AFTER
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/CompiledShaders)
 
-# Call DXC to compile shader into headers
-add_custom_command(TARGET MyRRALoader PRE_LINK
-  COMMAND dxc.exe /Zi /Od /Vn"g_pPrimaryRay" /Tlib_6_5 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/primaryray.hlsl.h" /nologo shaders/primaryray.hlsl -Qembed_debug
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set(SHADER_OUTPUTS)
 
-add_custom_command(TARGET MyRRALoader PRE_LINK
-  COMMAND dxc.exe /Zi /Od /Vn"g_pAoRay" /Tlib_6_5 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/aoray.hlsl.h" /nologo shaders/aoray.hlsl -Qembed_debug
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+# Call DXC to compile shader into headers every time the shaders change
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/CompiledShaders/primaryray.hlsl.h
+  COMMENT "Building PrimaryRay shader"
+  COMMAND dxc.exe /Zi /Od /Vn"g_pPrimaryRay" /Tlib_6_5 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/primaryray.hlsl.h" /nologo shaders/primaryray.hlsl -Qembed_debug /O3
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/primaryray.hlsl
+)
+list(APPEND SHADER_OUTPUTS
+  ${CMAKE_BINARY_DIR}/CompiledShaders/primaryray.hlsl.h
+)
 
-add_custom_command(TARGET MyRRALoader PRE_LINK
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/CompiledShaders/aoray.hlsl.h
+  COMMENT "Building AoRay shader"
+  COMMAND dxc.exe /Zi /Od /Vn"g_pAoRay" /Tlib_6_5 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/aoray.hlsl.h" /nologo shaders/aoray.hlsl -Qembed_debug /O3
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/aoray.hlsl
+)
+list(APPEND SHADER_OUTPUTS
+  ${CMAKE_BINARY_DIR}/CompiledShaders/aoray.hlsl.h
+)
+
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_ps.hlsl.h
+  COMMENT "Building FullscreenQuad PS"
   COMMAND dxc.exe /Zi /Od /EPSMain /Vn"g_pFsQuad_PS" /Tps_4_0 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_ps.hlsl.h" /nologo shaders/fsquad.hlsl -Qembed_debug
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/fsquad.hlsl
+)
+list(APPEND SHADER_OUTPUTS
+  ${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_ps.hlsl.h
+)
 
-add_custom_command(TARGET MyRRALoader PRE_LINK
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_vs.hlsl.h
+  COMMENT "Building FullscreenQuad VS"
   COMMAND dxc.exe /Zi /Od /EVSMain /Vn"g_pFsQuad_VS" /Tvs_4_0 /Fh"${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_vs.hlsl.h" /nologo shaders/fsquad.hlsl -Qembed_debug
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/fsquad.hlsl
+)
+list(APPEND SHADER_OUTPUTS
+  ${CMAKE_BINARY_DIR}/CompiledShaders/fsquad_vs.hlsl.h
+)
+
+# All shader targets are tied to ALL
+add_custom_target(Shaders ALL
+  DEPENDS ${SHADER_OUTPUTS}
+)
+add_dependencies(MyRRALoader Shaders)
 
 # Set debugging CWD
 set_target_properties(MyRRALoader PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:MyRRALoader>")
@@ -100,12 +132,4 @@ add_custom_command(
             "$<TARGET_FILE_DIR:MyRRALoader>"
     COMMAND_EXPAND_LISTS
     COMMENT "Copying glfw3.dll to the binary directory"
-)
-add_custom_command(
-    TARGET MyRRALoader POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/shaders"
-            "$<TARGET_FILE_DIR:MyRRALoader>/shaders"
-    COMMAND_EXPAND_LISTS
-    COMMENT "Copying shaders to the binary directory"
 )
