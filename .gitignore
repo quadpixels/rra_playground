@@ -1,2 +1,7 @@
 build
 *.zip
+build_imgui
+build_nmake
+build_nmake2
+build_nmake3
+build_nmake4

@@ -7,7 +7,10 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
+#include <mutex>
+#include <sstream>
 #include <thread>
 
 #include <GLFW/glfw3.h>
@@ -29,11 +32,12 @@
 #include <dxcapi.h>
 #include <DirectXMath.h>
 
-#include "public/rra_bvh.h"
-#include "public/rra_blas.h"
-#include "public/rra_tlas.h"
-#include "public/rra_trace_loader.h"
-#include "public/rra_ray_history.h"
+#include <imgui.h>
+#include <backends/imgui_impl_dx12.h>
+#include <backends/imgui_impl_glfw.h>
+
+#include "app_state.h"
+#include "scene.h"
 
 #undef min
 #undef max
@@ -89,24 +93,6 @@ struct FrameTime
 
 FrameTime g_frame_time;
 
-struct CamParams
-{
-    glm::vec3 eye, center, up;
-    bool      invert_y;
-};
-
-std::map<std::string, CamParams> CAM_PARAMS = {
-    {"SolarBay", {glm::vec3(5.964f, 1.691f, 5.374f), glm::vec3(2.921f, 1.691f, 2.120f), glm::vec3(0, 1, 0), false}},
-    {"PortRoyal", {glm::vec3(-7.2252469f, 0.8361527f, 25.2023430f), glm::vec3(-6.8860960f, 0.8613553f, 24.2284565f), glm::vec3(0, 1, 0), true}},
-    {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
-    {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
-    {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
-    {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}},
-    {"VictorStones", {glm::vec3(54.20388, -360.680725, 20.8701935), glm::vec3(93.000, -316.9831, 29.51616), glm::vec3(0, 0, 1), true}},
-    {"AncientGame", {glm::vec3(-290.0213013, 230.9532928, 341.0099792), glm::vec3(-344.7103882, 227.3368835, 347.0361633), glm::vec3(0,0,1), true}},
-    {"ThreeTriangles", {glm::vec3(60.1231461, 90.5544434, 25.7323875), glm::vec3(60.0977364, 86.9188461, 25.4270802), glm::vec3(0, 0, 1), true}}
-};
-
 struct Vertex
 {
     DirectX::XMFLOAT3 position;
@@ -158,6 +144,7 @@ ID3D12StateObjectProperties* g_rt_state_object_props_ao;
 ID3D12RootSignature* g_rootsig_fsquad{};
 ID3D12PipelineState* g_pipeline_fsquad{};
 ID3D12DescriptorHeap* g_srv_uav_cbv_heap_fsquad{};
+ID3D12DescriptorHeap* g_imgui_srv_heap{};
 ID3D12Resource*       g_fsquad_vb;
 D3D12_VERTEX_BUFFER_VIEW g_fsquad_vbv;
 
@@ -207,7 +194,8 @@ int          g_frame_index;
 
 const char* g_rra_file_name;
 
-std::atomic<bool> g_as_built{false};
+AppState  g_app_state;
+SceneData g_scene_data;
 
 glm::vec3 g_scene_aabb_min{1e20, 1e20, 1e20}, g_scene_aabb_max{-1e20, -1e20, -1e20};
 float     g_ao_radius{10000};
@@ -348,6 +336,179 @@ void GlmMat4ToDirectXMatrix(DirectX::XMMATRIX* out, const glm::mat4& m)
     }
 }
 
+const char* ToString(SceneLoadStage stage)
+{
+    switch (stage)
+    {
+    case SceneLoadStage::kIdle:
+        return "Idle";
+    case SceneLoadStage::kLoadingTrace:
+        return "Loading trace";
+    case SceneLoadStage::kExtractingBlas:
+        return "Extracting BLAS";
+    case SceneLoadStage::kExtractingTlas:
+        return "Extracting TLAS";
+    case SceneLoadStage::kBuildingGpuBlas:
+        return "Building GPU BLAS";
+    case SceneLoadStage::kBuildingGpuTlas:
+        return "Building GPU TLAS";
+    case SceneLoadStage::kReady:
+        return "Ready";
+    case SceneLoadStage::kFailed:
+        return "Failed";
+    default:
+        return "Unknown";
+    }
+}
+
+void ApplySceneCamera(const SceneData& scene)
+{
+    g_invert_y = scene.camera.invert_y;
+    g_cam_pos  = scene.camera.eye;
+
+    glm::mat4 view = glm::lookAt(scene.camera.eye, scene.camera.center, scene.camera.up);
+    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
+    if (scene.camera.preset_name == "FallbackCube")
+    {
+        proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
+    }
+
+    g_inv_view = glm::inverse(view);
+    g_inv_proj = glm::inverse(proj);
+}
+
+std::vector<std::vector<Vertex>> ConvertSceneVertices(const SceneData& scene)
+{
+    std::vector<std::vector<Vertex>> vertices;
+    vertices.reserve(scene.blas_vertices.size());
+    for (const auto& mesh_vertices : scene.blas_vertices)
+    {
+        std::vector<Vertex> converted;
+        converted.reserve(mesh_vertices.size());
+        for (const glm::vec3& p : mesh_vertices)
+        {
+            converted.push_back({{p.x, p.y, p.z}});
+        }
+        vertices.push_back(std::move(converted));
+    }
+    return vertices;
+}
+
+std::vector<InstanceInfo> ConvertSceneInstances(const SceneData& scene)
+{
+    std::vector<InstanceInfo> instances(scene.instances.size());
+    for (size_t i = 0; i < scene.instances.size(); i++)
+    {
+        instances[i].blas_idx = scene.instances[i].blas_idx;
+        memcpy(instances[i].transform, scene.instances[i].transform, sizeof(instances[i].transform));
+    }
+    return instances;
+}
+
+void InitImGui()
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = 1;
+    heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_imgui_srv_heap)));
+
+    ImGui_ImplGlfw_InitForOther(g_window, true);
+    ImGui_ImplDX12_InitInfo init_info{};
+    init_info.Device                    = g_device12;
+    init_info.CommandQueue              = g_command_queue;
+    init_info.NumFramesInFlight         = FRAME_COUNT;
+    init_info.RTVFormat                 = DXGI_FORMAT_R8G8B8A8_UNORM;
+    init_info.DSVFormat                 = DXGI_FORMAT_UNKNOWN;
+    init_info.SrvDescriptorHeap         = g_imgui_srv_heap;
+    init_info.LegacySingleSrvCpuDescriptor = g_imgui_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    init_info.LegacySingleSrvGpuDescriptor = g_imgui_srv_heap->GetGPUDescriptorHandleForHeapStart();
+    ImGui_ImplDX12_Init(&init_info);
+}
+
+void ShutdownImGui()
+{
+    ImGui_ImplDX12_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+}
+
+void DrawImGuiPanel()
+{
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    SceneStats stats;
+    std::string status_line;
+    std::string last_error;
+    {
+        std::lock_guard<std::mutex> lock(g_app_state.details_mutex);
+        stats       = g_app_state.scene_stats;
+        status_line = g_app_state.status_line;
+        last_error  = g_app_state.last_error;
+    }
+
+    ImGui::SetNextWindowBgAlpha(0.82f);
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Runtime"))
+    {
+        ImGui::Text("Stage: %s", ToString(g_app_state.scene_stage.load()));
+        ImGui::Text("GPU frame: %.3f ms", g_app_state.last_gpu_frame_ms);
+        ImGui::Text("Render: %dx%d -> %dx%d", RT_W, RT_H, WIN_W, WIN_H);
+        ImGui::Text("Mode: %s", g_use_ao ? "AO rays" : "Primary rays");
+        if (g_use_ao)
+        {
+            ImGui::Text("AO samples: %d", g_ao_sample_count);
+            ImGui::Text("AO radius: %.1f", g_ao_radius);
+        }
+        ImGui::Text("Ray binning: %d", g_use_ray_binning);
+        ImGui::Text("PIX rays: %s", g_use_ray_in_pix ? "on" : "off");
+        ImGui::Separator();
+
+        const int blas_total = static_cast<int>(g_app_state.blas_total.load());
+        const int blas_done  = static_cast<int>(g_app_state.blas_completed.load());
+        const int tlas_total = static_cast<int>(g_app_state.tlas_total.load());
+        const int tlas_done  = static_cast<int>(g_app_state.tlas_completed.load());
+        ImGui::Text("BLAS progress: %d / %d", blas_done, blas_total);
+        if (blas_total > 0)
+        {
+            ImGui::ProgressBar(static_cast<float>(blas_done) / blas_total, ImVec2(-1.0f, 0.0f));
+        }
+        ImGui::Text("TLAS progress: %d / %d", tlas_done, tlas_total);
+        if (tlas_total > 0)
+        {
+            ImGui::ProgressBar(static_cast<float>(tlas_done) / tlas_total, ImVec2(-1.0f, 0.0f));
+        }
+        if (!status_line.empty())
+        {
+            ImGui::TextWrapped("%s", status_line.c_str());
+        }
+        if (!last_error.empty())
+        {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", last_error.c_str());
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Scene source: %s", stats.source_name.empty() ? "<none>" : stats.source_name.c_str());
+        ImGui::Text("Camera preset: %s", stats.camera_preset.empty() ? "<default>" : stats.camera_preset.c_str());
+        ImGui::Text("TLAS: %llu", stats.tlas_count);
+        ImGui::Text("BLAS: %llu", stats.blas_count);
+        ImGui::Text("Instances: %llu", stats.instance_count);
+        ImGui::Text("Triangles: %llu", stats.total_triangle_count);
+        ImGui::Text("AABB min: %.3f %.3f %.3f", stats.scene_aabb_min.x, stats.scene_aabb_min.y, stats.scene_aabb_min.z);
+        ImGui::Text("AABB max: %.3f %.3f %.3f", stats.scene_aabb_max.x, stats.scene_aabb_max.y, stats.scene_aabb_max.z);
+    }
+    ImGui::End();
+
+    ImGui::Render();
+}
+
 IDxcBlob* CompileShaderLibrary(LPCWSTR fileName)
 {
     static IDxcCompiler*       pCompiler = nullptr;
@@ -413,6 +574,11 @@ IDxcBlob* CompileShaderLibrary(LPCWSTR fileName)
 
 void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
+    if (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureKeyboard)
+    {
+        return;
+    }
+
     if (action == GLFW_PRESS)
     {
         switch (key)
@@ -564,7 +730,6 @@ void CreateMyRRALoaderWindow()
 
     glfwSetKeyCallback(g_window, KeyCallback);
     glfwSetWindowSizeCallback(g_window, WindowResizeCallback);
-    glfwSetWindowMaximizeCallback(g_window, WindowMaximizeCallback);
     glfwSetWindowSizeLimits(g_window, 64, 64, GLFW_DONT_CARE, GLFW_DONT_CARE);
 }
 
@@ -623,7 +788,7 @@ void InitDeviceAndCommandQ()
     CE(g_device12->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&g_command_queue)));
     CE(g_device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)));
     g_fence_value = 1;
-    g_fence_event = CreateEvent(nullptr, false, false, L"Fence");
+    g_fence_event = CreateEventW(nullptr, false, false, L"Fence");
     g_command_queue->SetName(L"Command Queue");
 
     if (g_set_steady_power_state)
@@ -1374,6 +1539,8 @@ void CreateShaderBindingTable()
 
 void Render()
 {
+    DrawImGuiPanel();
+
     // Update
     char* mapped;
     g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
@@ -1410,7 +1577,7 @@ void Render()
 
     g_command_list->ClearRenderTargetView(handle_rtv, bg_color, 0, nullptr);
 
-    if (g_as_built)
+    if (g_app_state.as_built.load())
     {
         D3D12_RESOURCE_BARRIER barrier_rt_out = barrier_rtv;
         barrier_rt_out.Transition.pResource   = g_rt_output_resource;
@@ -1528,9 +1695,6 @@ void Render()
 
             g_command_list->CopyResource(g_rendertargets[g_frame_index], g_rt_output_resource);
 
-            barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-            g_command_list->ResourceBarrier(1, &barrier_rtv);
         }
         else  // FSQUAD
         {
@@ -1569,18 +1733,16 @@ void Render()
             barrier_rt_out.Transition.StateBefore  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             barrier_rt_out.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_command_list->ResourceBarrier(1, &barrier_rt_out);
-
-            barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-            g_command_list->ResourceBarrier(1, &barrier_rtv);
         }
     }
-    else
-    {
-        barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-        g_command_list->ResourceBarrier(1, &barrier_rtv);
-    }
+
+    g_command_list->OMSetRenderTargets(1, &handle_rtv, false, nullptr);
+    g_command_list->SetDescriptorHeaps(1, &g_imgui_srv_heap);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_command_list);
+
+    barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    g_command_list->ResourceBarrier(1, &barrier_rtv);
 
     CE(g_command_list->Close());
     g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_command_list);
@@ -1796,9 +1958,11 @@ void Render()
     if (g_frame_time.ShouldUpdate())
     {
         std::stringstream ss;
-        if (!g_as_built)
+        if (!g_app_state.as_built.load())
         {
-            // Update in building procedure
+            std::stringstream ss;
+            ss << "MyRRAPlayground " << ToString(g_app_state.scene_stage.load());
+            glfwSetWindowTitle(g_window, ss.str().c_str());
         }
         else
         {
@@ -1847,6 +2011,7 @@ void Render()
             {
                 ss << " ray_binning=" << std::to_string(g_use_ray_binning);
             }
+            g_app_state.last_gpu_frame_ms = g_frame_time.GetFrameTime() * 1000.0f;
             glfwSetWindowTitle(g_window, ss.str().c_str());
         }
     }
@@ -1854,6 +2019,11 @@ void Render()
 
 void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vector<InstanceInfo>& inst_infos)
 {
+    g_app_state.scene_stage.store(SceneLoadStage::kBuildingGpuBlas);
+    g_app_state.blas_total.store(static_cast<uint32_t>(vertices.size()));
+    g_app_state.blas_completed.store(0);
+    g_app_state.SetStatus("Building GPU BLAS");
+
     std::vector<ID3D12Resource*> blases;
     std::vector<ID3D12Resource*> transform_buffers;
 
@@ -1939,7 +2109,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
         printf("BLAS[%u] prebuild info:", i_blas);
         printf(" Scratch: %d", int(pb_info.ScratchDataSizeInBytes));
         printf(", Result : %d\n", int(pb_info.ResultDataMaxSizeInBytes));
-        glfwSetWindowTitle(g_window, (std::string("Building BLAS ") + std::to_string(i_blas+1) + "/" + std::to_string(vertices.size())).c_str());
+        g_app_state.SetStatus(std::string("Building BLAS ") + std::to_string(i_blas + 1) + "/" + std::to_string(vertices.size()));
 
         D3D12_RESOURCE_DESC scratch_desc{};
         scratch_desc.Alignment          = 0;
@@ -1999,6 +2169,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 
         //blas_scratch->Release();
         blases.push_back(blas_result);
+        g_app_state.blas_completed.store(i_blas + 1);
     }
 
     for (uint32_t i_inst = 0; i_inst < inst_infos.size(); i_inst++)
@@ -2089,6 +2260,10 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     printf("TLAS prebuild info:");
     printf(" Scratch: %d", int(pb_info.ScratchDataSizeInBytes));
     printf(", Result : %d\n", int(pb_info.ResultDataMaxSizeInBytes));
+    g_app_state.scene_stage.store(SceneLoadStage::kBuildingGpuTlas);
+    g_app_state.tlas_total.store(1);
+    g_app_state.tlas_completed.store(0);
+    g_app_state.SetStatus("Building GPU TLAS");
 
     // TLAS
     D3D12_RESOURCE_DESC scratch_desc{};
@@ -2140,6 +2315,7 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     g_command_list1->Close();
     g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
     //WaitForPreviousFrame();
+    g_app_state.tlas_completed.store(1);
     
     // Cannot release until command is done
     // tlas_scratch->Release();
@@ -2207,409 +2383,39 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
     g_device12->CreateShaderResourceView(d_inst_offsets, &srv_desc, srv_handle);
 }
 
-void LoadCubeAndCreateAS()
+void LoadSceneAndCreateAS(bool rra_file_exists)
 {
-    std::vector<std::vector<Vertex>> verts = {{// Front face
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{1.0, -1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
+    g_app_state.scene_stage.store(SceneLoadStage::kIdle);
+    g_app_state.SetStatus("Preparing scene");
 
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-
-                                               // Back face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
-
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
-                                               {{1.0, -1.0, -1.0}},
-
-                                               // Top face
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-                                               {{1.0, 1.0, 1.0}},
-
-                                               {{-1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{1.0, 1.0, -1.0}},
-
-                                               // Bottom face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, 1.0}},
-
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{1.0, -1.0, 1.0}},
-                                               {{-1.0, -1.0, 1.0}},
-
-                                               // Right face
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
-
-                                               {{1.0, -1.0, -1.0}},
-                                               {{1.0, 1.0, 1.0}},
-                                               {{1.0, -1.0, 1.0}},
-
-                                               // Left face
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, -1.0, 1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-
-                                               {{-1.0, -1.0, -1.0}},
-                                               {{-1.0, 1.0, 1.0}},
-                                               {{-1.0, 1.0, -1.0}}}};
-
-    InstanceInfo info{};
-    info.blas_idx      = 0;
-    info.transform[0]  = 1;
-    info.transform[5]  = 1;
-    info.transform[10] = 1;
-
-    g_scene_aabb_min = {-1, -1, -1};
-    g_scene_aabb_max = {1, 1, 1};
-
-    std::vector<InstanceInfo> infos = {info};
-
-    CreateAS(verts, infos);
-
-    // Set Camera
-    glm::vec3 eye(2, 2, 5);
-    glm::vec3 center(0, 0, 0);
-    glm::vec3 up(0, 1, 0);
-
-    glm::mat4 view = glm::lookAt(eye, center, up);
-    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(90.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
-
-    g_inv_view = glm::inverse(view);
-    g_inv_proj = glm::inverse(proj);
-
-    char* mapped{};
-    g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
-    RayGenCB cb{};
-    GlmMat4ToDirectXMatrix(&cb.inverse_view, g_inv_view);
-    GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
-    cb.invert_y = g_invert_y;
-    cb.ao_samples = g_ao_sample_count;
-    memcpy(mapped, &cb, sizeof(RayGenCB));
-    g_raygen_cb->Unmap(0, nullptr);
-}
-
-void LoadRRAFileAndCreateAS(const char* rra_file_name)
-{
-    if (!std::filesystem::exists(rra_file_name))
+    SceneData scene;
+    if (rra_file_exists)
     {
-        printf("%s does not exist.\n", rra_file_name);
-        return;
-    }
-
-    RraErrorCode ec = RraTraceLoaderLoad(rra_file_name);
-    printf("Error: %d\n", static_cast<int>(ec));
-    if (ec)
-    {
-        printf("Error encountered, quitting.\n");
-        return;
-    }
-
-    {
-        time_t  ct = RraTraceLoaderGetCreateTime();
-        std::tm tm;
-        localtime_s(&tm, &ct);
-        char buffer[100];
-        std::strftime(buffer, 32, "%a, %Y-%m-%d %H:%M:%S", &tm);
-        printf("Trace create time: %s\n", buffer);
-
-        uint64_t tlas_count{}, blas_count{};
-        RraBvhGetTlasCount(&tlas_count);
-        RraBvhGetBlasCount(&blas_count);
-        printf("Trace has %llu TLASs and %llu BLASs\n", tlas_count, blas_count);
-
-        for (unsigned i = 1; i <= blas_count; i++)
+        if (!LoadSceneFromRra(g_rra_file_name, &g_app_state, &scene))
         {
-            uint32_t cnt{}, cnt1{}, cnt2{}, cnt3{};
-            uint64_t addr{};
-            RraBlasGetGeometryCount(i, &cnt);
-            RraBlasGetProceduralNodeCount(i, &cnt1);
-            RraBlasGetTriangleNodeCount(i, &cnt2);
-            RraBlasGetUniqueTriangleCount(i, &cnt3);
-            RraBlasGetBaseAddress(i, &addr);
-            printf("  BLAS[%u] (%llx) has %u geometries, %u proc nodes, %u tri nodes, %u uniq tris\n", i, addr, cnt, cnt1, cnt2, cnt3);
+            return;
         }
     }
-
-    // TLAS[0]'s instances
-    uint32_t tlas0_inst_count{0};
-    uint64_t tlas_count{0}, blas_count{0};
-
-    std::vector<InstanceInfo> tlas0_inst_infos;
-
-    // BLAS's vertices
-    std::vector<std::vector<Vertex>> vertices;
-    uint32_t                         tot_tri_count{0};
-
-    // Rays
+    else
     {
-        uint32_t dispatch_count{};
-        RraRayGetDispatchCount(&dispatch_count);
-        printf("dispatch_count=%u\n", dispatch_count);
-
-        for (uint32_t d = 0; d < dispatch_count; d++)
-        {
-            uint32_t x, y, z;
-            if (RraRayGetDispatchDimensions(d, &x, &y, &z) != kRraOk)
-                continue;
-            printf("  dispatch[%u], dim=(%u,%u,%u)\n", d, x, y, z);
-        }
+        scene = BuildFallbackCubeScene();
+        g_app_state.SetSceneStats(scene.stats);
+        g_app_state.scene_loaded.store(true);
+        g_app_state.blas_total.store(static_cast<uint32_t>(scene.blas_vertices.size()));
+        g_app_state.tlas_total.store(1);
+        g_app_state.SetStatus("Using fallback cube scene");
     }
 
-    // Triangles
-    {
-        RraBvhGetTlasCount(&tlas_count);
-        RraBvhGetBlasCount(&blas_count);
-        printf("Trace has %llu TLASs and %llu BLASs\n", tlas_count, blas_count);
+    g_scene_data     = scene;
+    g_scene_aabb_min = scene.stats.scene_aabb_min;
+    g_scene_aabb_max = scene.stats.scene_aabb_max;
+    ApplySceneCamera(scene);
 
-        uint32_t ptr{};
-        RraBvhGetRootNodePtr(&ptr) == kRraOk;
+    CreateAS(ConvertSceneVertices(scene), ConvertSceneInstances(scene));
 
-        for (unsigned i = 0; i <= blas_count; i++)
-        {
-            std::vector<Vertex> geom_verts;
-
-            uint32_t cnt{}, cnt1{}, cnt2{}, cnt3{};
-            uint64_t addr;
-            RraBlasGetGeometryCount(i, &cnt);
-            RraBlasGetProceduralNodeCount(i, &cnt1);
-            RraBlasGetTriangleNodeCount(i, &cnt2);
-            RraBlasGetUniqueTriangleCount(i, &cnt3);
-            RraBlasGetBaseAddress(i, &addr);
-
-            uint32_t root_node{};
-            RraBvhGetRootNodePtr(&root_node);
-            std::deque<uint32_t> n2v = {root_node};
-
-            if (i > 0)
-            {
-                float sa{};
-                RraBlasGetSurfaceArea(i, root_node, &sa);
-                if (sa <= 0)
-                {
-                    throw std::exception();
-                }
-            }
-
-            uint32_t num_tris{0};
-            while (!n2v.empty())
-            {
-                uint32_t node = n2v.front();
-                n2v.pop_front();
-
-                uint32_t nc{};
-                RraBlasGetChildNodeCount(i, node, &nc);
-                std::vector<uint32_t> children(nc);
-                RraBlasGetChildNodes(i, node, children.data());
-
-                for (uint32_t j = 0; j < children.size(); j++)
-                {
-                    uint32_t ch = children[j];
-                    if (RraBvhIsBoxNode(ch))
-                    {
-                        n2v.push_back(ch);
-                    }
-                    else if (RraBvhIsTriangleNode(ch))
-                    {
-                        float sa{};
-                        RraBlasGetSurfaceArea(i, ch, &sa);
-                        if (sa <= 0)
-                        {
-                            printf("BLAS[%u]'s node %08X's surface area is zero\n", i, ch);
-                        }
-
-                        uint32_t tc{};
-                        if (RraBlasGetNodeTriangleCount(i, ch, &tc) != kRraOk)
-                        {
-                            continue;
-                        }
-                        assert(tc < 3);
-
-                        std::vector<VertexPosition> v;
-                        v.resize(tc == 1 ? 3 : 4);
-                        if (RraBlasGetNodeVertices(i, ch, v.data()) != kRraOk)
-                        {
-                            continue;
-                        }
-
-                        if (sa > 0)
-                        {
-                            num_tris += tc;
-                            if (tc >= 1)
-                            {
-                                geom_verts.push_back({{v[0].x, v[0].y, v[0].z}});
-                                geom_verts.push_back({{v[1].x, v[1].y, v[1].z}});
-                                geom_verts.push_back({{v[2].x, v[2].y, v[2].z}});
-                                // printf("Tri1:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n",
-                                //     v[0].x, v[0].y, v[0].z,
-                                //     v[1].x, v[1].y, v[1].z,
-                                //     v[2].x, v[2].y, v[2].z);
-                            }
-
-                            // Note the winding direction of this one.
-                            if (tc >= 2)
-                            {
-                                geom_verts.push_back({{v[1].x, v[1].y, v[1].z}});
-                                geom_verts.push_back({{v[3].x, v[3].y, v[3].z}});
-                                geom_verts.push_back({{v[2].x, v[2].y, v[2].z}});
-                            }
-                        }
-
-                        if (sa <= 0)
-                        {
-                            printf("Tri1:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n", v[0].x, v[0].y, v[0].z, v[1].x, v[1].y, v[1].z, v[2].x, v[2].y, v[2].z);
-                            if (tc >= 2)
-                            {
-                                printf("Tri2:(%g,%g,%g)-(%g,%g,%g)-(%g,%g,%g)\n", v[1].x, v[1].y, v[1].z, v[3].x, v[3].y, v[3].z, v[2].x, v[2].y, v[2].z);
-                            }
-                        }
-                    }
-                }
-            }
-            // printf("  BLAS[%u] (%lx): %u geoms, %u proc & %u tri nodes, %u uniq tris, %u visited\n",
-            //     i, addr, cnt, cnt1, cnt2, cnt3, num_tris);
-            tot_tri_count += num_tris;
-            vertices.push_back(geom_verts);
-        }
-
-        // Tlas
-        if (tlas_count > 1)
-        {
-            printf("%zu TLAS detected. Will only make use of the first TLAS.\n", tlas_count);
-        }
-
-        for (unsigned i = 0; i < std::min(1, static_cast<int>(tlas_count)); i++)
-        {
-            uint64_t node_count{};
-            uint32_t inst_count{};
-            RraTlasGetBoxNodeCount(i, &node_count);
-
-            uint32_t root_node{};
-            RraBvhGetRootNodePtr(&root_node);
-            std::deque<uint32_t> n2v = {root_node};
-
-            // for (unsigned j=0; j<=blas_count; j++) {
-            //     uint64_t x{};
-            //     RraTlasGetInstanceCount(i, j, &x) == kRraOk);
-            //     inst_count += x;
-            // }
-
-            std::vector<InstanceInfo> instance_infos;
-
-            while (!n2v.empty())
-            {
-                uint32_t node = n2v.front();
-                n2v.pop_front();
-
-                uint32_t nc{};
-                RraTlasGetChildNodeCount(i, node, &nc);
-                std::vector<uint32_t> children(nc);
-                RraTlasGetChildNodes(i, node, children.data());
-
-                for (uint32_t j = 0; j < children.size(); j++)
-                {
-                    uint32_t ch = children[j];
-                    if (RraBvhIsBoxNode(ch))
-                    {
-                        n2v.push_back(ch);
-                    }
-                    else if (RraBvhIsInstanceNode(ch))
-                    {
-                        InstanceInfo ii{};
-                        RraTlasGetOriginalInstanceNodeTransform(i, ch, ii.transform);
-                        RraTlasGetBlasIndexFromInstanceNode(i, ch, &(ii.blas_idx));
-                        uint32_t iidx{};
-                        RraTlasGetInstanceIndexFromInstanceNode(i, ch, &iidx);
-                        if (instance_infos.size() < iidx + 1)
-                        {
-                            instance_infos.resize(iidx + 1);
-                        }
-                        instance_infos[iidx] = ii;
-
-                        // Refresh the scene's AABB
-                        std::vector<Vertex>& verts = vertices.at(ii.blas_idx);
-                        for (const Vertex& v : verts)
-                        {
-                            DirectX::XMFLOAT3 vt{};
-                            DirectX::XMFLOAT3 p = v.position;
-                            float*             t = ii.transform;
-                            vt.x                 = t[3] + t[0] * p.x + t[1] * p.y + t[2] * p.z;
-                            vt.y                 = t[7] + t[4] * p.x + t[5] * p.y + t[6] * p.z;
-                            vt.z                 = t[11] + t[8] * p.x + t[9] * p.y + t[10] * p.z;
-                            g_scene_aabb_min.x   = std::min(g_scene_aabb_min.x, vt.x);
-                            g_scene_aabb_min.y   = std::min(g_scene_aabb_min.y, vt.y);
-                            g_scene_aabb_min.z   = std::min(g_scene_aabb_min.z, vt.z);
-                            g_scene_aabb_max.x   = std::max(g_scene_aabb_max.x, vt.x);
-                            g_scene_aabb_max.y   = std::max(g_scene_aabb_max.y, vt.y);
-                            g_scene_aabb_max.z   = std::max(g_scene_aabb_max.z, vt.z);
-                        }
-                    }
-                }
-            }
-            inst_count = instance_infos.size();
-
-            printf("TLAS %u: %lu nodes, %u insts\n", i, node_count, inst_count);
-
-            tlas0_inst_count = inst_count;
-            tlas0_inst_infos = instance_infos;
-        }
-    }
-
-    printf("Scene AABB: (%g,%g,%g)-(%g,%g,%g)\n",
-           g_scene_aabb_min.x,
-           g_scene_aabb_min.y,
-           g_scene_aabb_min.z,
-           g_scene_aabb_max.x,
-           g_scene_aabb_max.y,
-           g_scene_aabb_max.z);
-
-    CreateAS(vertices, tlas0_inst_infos);
-
-    // Set Camera
-    glm::vec3 eye(0, 0, 0);
-    glm::vec3 center(0, 1, 0);
-    glm::vec3 up(0, 1, 0);
-    g_invert_y = false;
-
-    std::string fn(g_rra_file_name);
-    for (const auto& entry : CAM_PARAMS)
-    {
-        printf("Comparing %s vs %s..\n", entry.first.c_str(), fn.c_str());
-        if (fn.find(entry.first) != std::string::npos)
-        {
-            printf("Using camera params for %s\n", entry.first.c_str());
-            eye        = entry.second.eye;
-            center     = entry.second.center;
-            up         = entry.second.up;
-            g_cam_pos  = eye;
-            g_invert_y = entry.second.invert_y;
-        }
-    }
-
-    glm::mat4 view = glm::lookAt(eye, center, up);
-    glm::mat4 proj = glm::perspectiveLH_ZO(glm::radians(60.0f), -1.0f * RT_W / RT_H, -0.1f, -499.0f) * (-1.0f);
-
-    g_inv_view = glm::inverse(view);
-    g_inv_proj = glm::inverse(proj);
-
-    char* mapped{};
-    g_raygen_cb->Map(0, nullptr, (void**)(&mapped));
-    RayGenCB cb{};
-    GlmMat4ToDirectXMatrix(&cb.inverse_view, g_inv_view);
-    GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
-    cb.invert_y = g_invert_y;
-    cb.ao_samples = g_ao_sample_count;
-    memcpy(mapped, &cb, sizeof(RayGenCB));
-    g_raygen_cb->Unmap(0, nullptr);
+    g_app_state.scene_stage.store(SceneLoadStage::kReady);
+    g_app_state.as_built.store(true);
+    g_app_state.SetStatus("Scene ready");
 }
 
 void ReadPixBufferDump(const char* filename)
@@ -2726,20 +2532,13 @@ int main(int argc, char** argv)
     InitDeviceAndCommandQ();
     InitSwapChain();
     InitDX12Stuff();
+    InitImGui();
 
     CreateRTPipeline();
     CreateShaderBindingTable();
 
     std::thread thd([&]() {
-        if (rra_file_exists)
-        {
-            LoadRRAFileAndCreateAS(g_rra_file_name);
-        }
-        else
-        {
-            LoadCubeAndCreateAS();
-        }
-        g_as_built = true;
+        LoadSceneAndCreateAS(rra_file_exists);
     });
 
     while (!glfwWindowShouldClose(g_window))
@@ -2749,6 +2548,7 @@ int main(int argc, char** argv)
     }
 
     thd.join();
+    ShutdownImGui();
 
     return 0;
 }

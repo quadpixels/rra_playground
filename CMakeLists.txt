@@ -10,10 +10,22 @@ set(CMAKE_CONFIGURATION_TYPES "Release;Debug")
 set(CMAKE_CXX_STANDARD 20)
 
 add_executable(MyRRALoader
-  main.cpp)
+  main.cpp
+  scene.cpp
+  third_party/imgui/imgui.cpp
+  third_party/imgui/imgui_draw.cpp
+  third_party/imgui/imgui_tables.cpp
+  third_party/imgui/imgui_widgets.cpp
+  third_party/imgui/backends/imgui_impl_dx12.cpp
+  third_party/imgui/backends/imgui_impl_glfw.cpp)
 
 include_directories(AFTER
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/third_party/imgui
+  ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
+  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/include
   ${RRA_PATH}/external/third_party
+  ${RRA_PATH}/external/third_party/glm
   ${RRA_PATH}/source/backend
   )
 
@@ -27,6 +39,7 @@ target_link_libraries(MyRRALoader debug
   ${RRA_PATH}/build/win/vs2022/external/rdf/rdf/Debug/amdrdf-d.lib
   ${RRA_PATH}/build/win/vs2022/external/rdf/imported/zstd/Debug/zstd-d.lib
   ${RRA_PATH}/build/win/vs2022/external/system_info_utils/source/Debug/system_info-d.lib
+  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/lib-vc2010-64/glfw3.lib
   dxcompiler.lib
 )
 
@@ -35,6 +48,7 @@ target_link_libraries(MyRRALoader optimized
   ${RRA_PATH}/build/win/vs2022/external/rdf/rdf/Release/amdrdf.lib
   ${RRA_PATH}/build/win/vs2022/external/rdf/imported/zstd/Release/zstd.lib
   ${RRA_PATH}/build/win/vs2022/external/system_info_utils/source/Release/system_info.lib
+  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/lib-vc2010-64/glfw3.lib
   dxcompiler.lib
 )
 
