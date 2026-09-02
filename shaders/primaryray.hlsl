@@ -39,8 +39,8 @@ void RayGen()
 
         HitInfo payload = { float4(0, 0, 0, 1), 0 };
         TraceRay(Scene,
-            RAY_FLAG_NONE,
-            0xFF, 0, 0, 0, ray, payload);
+            rpbm.ray_flags,
+            rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
         CompactRayResults[compact_id] = payload.colorAndDistance;
         return;
     }
@@ -67,8 +67,8 @@ void RayGen()
 
                     HitInfo payload = { float4(0, 0, 0, 1), 0 };
                     TraceRay(Scene,
-                        RAY_FLAG_NONE,
-                        0xFF, 0, 0, 0, ray, payload);
+                        rpbm.ray_flags,
+                        rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
                     sum += payload.colorAndDistance;
                 }
                 ret = sum / float(nr);

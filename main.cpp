@@ -53,6 +53,18 @@ enum class DispatchRayLayoutMode
     kReflowBlocks = 1,
 };
 
+struct GpuRayInPix
+{
+    float    origin[3]{};
+    float    tmin{0.001f};
+    float    direction[3]{};
+    float    tmax{10000.0f};
+    uint32_t ray_flags{0};
+    uint32_t instance_inclusion_mask{0xFF};
+};
+
+static_assert(sizeof(GpuRayInPix) == 40);
+
 std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
 glm::uvec3                         g_ray_in_pix_dispatch_dims;
 std::vector<RayInPixDumpFileMinimal> g_display_ray_buffer;
@@ -549,6 +561,28 @@ void CreateStructuredBufferSrv(ID3D12Resource** resource,
     g_device12->CreateShaderResourceView(*resource, &srv_desc, handle);
 }
 
+std::vector<GpuRayInPix> BuildGpuRayUploadBuffer(const std::vector<RayInPixDumpFileMinimal>& rays)
+{
+    std::vector<GpuRayInPix> upload_rays;
+    upload_rays.reserve(rays.size());
+    for (const RayInPixDumpFileMinimal& ray : rays)
+    {
+        GpuRayInPix out_ray{};
+        out_ray.origin[0] = ray.origin.x;
+        out_ray.origin[1] = ray.origin.y;
+        out_ray.origin[2] = ray.origin.z;
+        out_ray.tmin = ray.tmin;
+        out_ray.direction[0] = ray.direction.x;
+        out_ray.direction[1] = ray.direction.y;
+        out_ray.direction[2] = ray.direction.z;
+        out_ray.tmax = ray.tmax;
+        out_ray.ray_flags = ray.ray_flags;
+        out_ray.instance_inclusion_mask = ray.instance_inclusion_mask;
+        upload_rays.push_back(out_ray);
+    }
+    return upload_rays;
+}
+
 void CreateStructuredBufferUav(ID3D12Resource** resource, size_t element_size, uint32_t element_count, uint32_t descriptor_index)
 {
     ReleaseResource(resource);
@@ -604,10 +638,11 @@ void UpdateDispatchRayGpuBuffers()
         RebuildGpuDispatchRays();
     }
 
+    std::vector<GpuRayInPix> upload_rays = BuildGpuRayUploadBuffer(g_gpu_dispatch_ray_buffer);
     CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
-                              g_gpu_dispatch_ray_buffer.empty() ? nullptr : g_gpu_dispatch_ray_buffer.data(),
-                              sizeof(RayInPixDumpFileMinimal),
-                              static_cast<uint32_t>(g_gpu_dispatch_ray_buffer.size()),
+                              upload_rays.empty() ? nullptr : upload_rays.data(),
+                              sizeof(GpuRayInPix),
+                              static_cast<uint32_t>(upload_rays.size()),
                               8);
     CreateStructuredBufferSrv(&g_ray_entry_offsets_buffer,
                               g_gpu_dispatch_ray_offsets.empty() ? nullptr : g_gpu_dispatch_ray_offsets.data(),
@@ -628,10 +663,11 @@ void UpdateCompactDispatchReplayGpuBuffers()
         BuildCompactDispatchReplay();
     }
 
+    std::vector<GpuRayInPix> upload_rays = BuildGpuRayUploadBuffer(g_compact_dispatch_replay.rays);
     CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
-                              g_compact_dispatch_replay.rays.empty() ? nullptr : g_compact_dispatch_replay.rays.data(),
-                              sizeof(RayInPixDumpFileMinimal),
-                              static_cast<uint32_t>(g_compact_dispatch_replay.rays.size()),
+                              upload_rays.empty() ? nullptr : upload_rays.data(),
+                              sizeof(GpuRayInPix),
+                              static_cast<uint32_t>(upload_rays.size()),
                               8);
     CreateStructuredBufferSrv(&g_compact_batch_pixel_offsets_buffer,
                               g_compact_dispatch_replay.batch_pixel_ranges.empty() ? nullptr : g_compact_dispatch_replay.batch_pixel_ranges.data(),
