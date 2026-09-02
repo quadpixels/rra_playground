@@ -62,6 +62,12 @@ SceneCamera ChooseCameraPreset(const std::string& file_name)
     return camera;
 }
 
+bool IsRraBlasTriangleNode(uint64_t blas_index, uint32_t node)
+{
+    uint32_t tri_count = 0;
+    return RraBlasGetNodeTriangleCount(blas_index, node, &tri_count) == kRraOk && tri_count > 0;
+}
+
 uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
                                     uint32_t node,
                                     std::vector<glm::vec3>* geom_verts,
@@ -72,7 +78,7 @@ uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
     const uint32_t topology_index = static_cast<uint32_t>(topology->nodes.size());
     topology->nodes.push_back({});
 
-    if (RraBvhIsTriangleNode(node))
+    if (IsRraBlasTriangleNode(blas_index, node))
     {
         float sa = 0.0f;
         RraBlasGetSurfaceArea(blas_index, node, &sa);
@@ -113,7 +119,7 @@ uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
     uint32_t primitive_count = 0;
     for (uint32_t child : children)
     {
-        if (!(RraBvhIsBoxNode(child) || RraBvhIsTriangleNode(child)))
+        if (!(RraBvhIsBoxNode(child) || IsRraBlasTriangleNode(blas_index, child)))
         {
             continue;
         }
