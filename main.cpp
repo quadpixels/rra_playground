@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 
@@ -37,24 +39,39 @@
 #include <backends/imgui_impl_glfw.h>
 
 #include "app_state.h"
+#include "cpu_renderer.h"
 #include "scene.h"
 
 #undef min
 #undef max
 
-struct RayInPixDumpFileMinimal
+using RayInPixDumpFileMinimal = SceneRay;
+
+enum class DispatchRayLayoutMode
 {
-    //uint32_t   type;
-    //glm::uvec3 dispatch_rays_idx;
-    glm::vec3  origin;
-    float      tmin;
-    glm::vec3  direction;
-    float      tcurrent;
-    //uint32_t   ray_flags;
+    kClampToViewport = 0,
+    kReflowBlocks = 1,
 };
+
 std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
 glm::uvec3                         g_ray_in_pix_dispatch_dims;
-bool                               g_use_ray_in_pix{false};
+std::vector<RayInPixDumpFileMinimal> g_display_ray_buffer;
+std::vector<uint32_t>                g_display_ray_offsets;
+uint32_t                             g_display_ray_active_pixels{0};
+uint32_t                             g_display_ray_max_rays_per_pixel{0};
+std::vector<RayInPixDumpFileMinimal> g_gpu_dispatch_ray_buffer;
+std::vector<uint32_t>                g_gpu_dispatch_ray_offsets;
+glm::uvec3                           g_gpu_dispatch_ray_dims{0};
+uint32_t                             g_gpu_dispatch_ray_active_pixels{0};
+uint32_t                             g_gpu_dispatch_ray_max_rays_per_pixel{0};
+int                                  g_selected_dispatch_index{0};
+int                                  g_dispatch_ray_layout_mode{0};
+int                                  g_dispatch_reflow_block_w{16};
+int                                  g_dispatch_reflow_block_h{16};
+bool                                 g_dispatch_reflow_skip_empty{true};
+bool                                 g_dispatch_ray_mapping_dirty{true};
+bool                                 g_dispatch_ray_gpu_dirty{true};
+bool                                 g_use_ray_in_pix{false};
 
 struct FrameTime
 {
@@ -147,6 +164,11 @@ ID3D12DescriptorHeap* g_srv_uav_cbv_heap_fsquad{};
 ID3D12DescriptorHeap* g_imgui_srv_heap{};
 ID3D12Resource*       g_fsquad_vb;
 D3D12_VERTEX_BUFFER_VIEW g_fsquad_vbv;
+ID3D12Resource*       g_cpu_rt_upload{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_cpu_rt_upload_footprint{};
+UINT g_cpu_rt_upload_num_rows{};
+UINT64 g_cpu_rt_upload_row_size{};
+UINT64 g_cpu_rt_upload_total_size{};
 
 glm::mat4 g_inv_view;
 glm::mat4 g_inv_proj;
@@ -182,6 +204,8 @@ ID3D12Resource*  g_query_readback_buffer;
 
 ID3D12Resource* g_rays_in_pix_buffer;
 ID3D12Resource* g_rays_in_pix_buffer_upload;
+ID3D12Resource* g_ray_entry_offsets_buffer;
+ID3D12Resource* g_ray_entry_offsets_buffer_upload;
 
 bool g_use_ao{false};
 int g_use_ray_binning{0};
@@ -196,6 +220,74 @@ const char* g_rra_file_name;
 
 AppState  g_app_state;
 SceneData g_scene_data;
+CpuPrimaryRayRenderer g_cpu_renderer;
+RenderBackend         g_render_backend{RenderBackend::kDxr};
+int                   g_cpu_thread_count{static_cast<int>(std::min(4u, std::thread::hardware_concurrency()))};
+bool                  g_cpu_refresh_requested{true};
+std::mutex            g_cpu_renderer_mutex;
+CpuBvhSettings        g_cpu_bvh_settings{};
+std::atomic<bool>     g_cpu_bvh_rebuild_requested{true};
+int                   g_cpu_bvh_fanout_index{0};
+bool                  g_cpu_use_rra_topology{false};
+int                   g_cpu_bvh_split_mode_index{1};
+int                   g_cpu_primitive_node_triangle_capacity{3};
+
+bool CopyToClipboard(const std::string& text)
+{
+    if (!OpenClipboard(NULL))
+    {
+        return false;
+    }
+    if (!EmptyClipboard())
+    {
+        CloseClipboard();
+        return false;
+    }
+    size_t size = (text.size() + 1) * sizeof(char);
+    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (hGlobal == NULL)
+    {
+        CloseClipboard();
+        return false;
+    }
+
+    char* pGlobal = (char*)GlobalLock(hGlobal);
+    memcpy(pGlobal, text.c_str(), size);
+    GlobalUnlock(hGlobal);
+
+    if (SetClipboardData(CF_TEXT, hGlobal) == NULL)
+    {
+        GlobalFree(hGlobal);
+        CloseClipboard();
+        return false;
+    }
+    CloseClipboard();
+    return true;
+}
+
+enum class CpuWorkerStage
+{
+    kIdle,
+    kBuildingBvh,
+    kRendering,
+};
+
+std::atomic<CpuWorkerStage> g_cpu_worker_stage{CpuWorkerStage::kIdle};
+std::mutex            g_cpu_worker_mutex;
+std::condition_variable g_cpu_worker_cv;
+std::thread           g_cpu_worker_thread;
+bool                  g_cpu_worker_exit{false};
+bool                  g_cpu_request_pending{false};
+std::atomic<bool>     g_cpu_worker_busy{false};
+uint64_t              g_cpu_request_generation{0};
+uint64_t              g_cpu_display_generation{0};
+uint32_t              g_cpu_display_tiles_completed{0};
+uint32_t              g_cpu_display_tiles_total{0};
+std::optional<CpuRenderRequest> g_pending_cpu_request;
+std::optional<CpuRenderResult>  g_latest_cpu_result;
+
+void RebuildDisplayDispatchRays();
+void RebuildGpuDispatchRays();
 
 glm::vec3 g_scene_aabb_min{1e20, 1e20, 1e20}, g_scene_aabb_max{-1e20, -1e20, -1e20};
 float     g_ao_radius{10000};
@@ -313,6 +405,100 @@ void CE(HRESULT x)
     }
 }
 
+void ReleaseResource(ID3D12Resource** resource)
+{
+    if (resource != nullptr && *resource != nullptr)
+    {
+        (*resource)->Release();
+        *resource = nullptr;
+    }
+}
+
+void CreateStructuredBufferSrv(ID3D12Resource** resource,
+                               const void* data,
+                               size_t element_size,
+                               uint32_t element_count,
+                               uint32_t descriptor_index)
+{
+    ReleaseResource(resource);
+
+    const uint32_t safe_element_count = std::max(1u, element_count);
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type                 = D3D12_HEAP_TYPE_UPLOAD;
+    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    props.CreationNodeMask     = 1;
+    props.VisibleNodeMask      = 1;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment          = 0;
+    desc.Width              = static_cast<UINT64>(safe_element_count) * element_size;
+    desc.Height             = 1;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(resource)));
+
+    void* mapped = nullptr;
+    (*resource)->Map(0, nullptr, &mapped);
+    if (data != nullptr && element_count > 0)
+    {
+        memcpy(mapped, data, static_cast<size_t>(element_count) * element_size);
+    }
+    else
+    {
+        memset(mapped, 0, static_cast<size_t>(safe_element_count) * element_size);
+    }
+    (*resource)->Unmap(0, nullptr);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Buffer.FirstElement        = 0;
+    srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
+    srv_desc.Buffer.NumElements         = safe_element_count;
+    srv_desc.Buffer.StructureByteStride = static_cast<UINT>(element_size);
+    srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
+    srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+    handle.ptr += descriptor_index * g_srv_uav_cbv_descriptor_size;
+    g_device12->CreateShaderResourceView(*resource, &srv_desc, handle);
+}
+
+void UpdateDispatchRayGpuBuffers()
+{
+    if (g_srv_uav_cbv_heap == nullptr || g_device12 == nullptr)
+    {
+        return;
+    }
+    if (g_dispatch_ray_mapping_dirty)
+    {
+        RebuildDisplayDispatchRays();
+    }
+    if (g_dispatch_ray_gpu_dirty)
+    {
+        RebuildGpuDispatchRays();
+    }
+
+    CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
+                              g_gpu_dispatch_ray_buffer.empty() ? nullptr : g_gpu_dispatch_ray_buffer.data(),
+                              sizeof(RayInPixDumpFileMinimal),
+                              static_cast<uint32_t>(g_gpu_dispatch_ray_buffer.size()),
+                              8);
+    CreateStructuredBufferSrv(&g_ray_entry_offsets_buffer,
+                              g_gpu_dispatch_ray_offsets.empty() ? nullptr : g_gpu_dispatch_ray_offsets.data(),
+                              sizeof(uint32_t),
+                              static_cast<uint32_t>(g_gpu_dispatch_ray_offsets.size()),
+                              9);
+    g_dispatch_ray_gpu_dirty = false;
+}
+
 void WaitForPreviousFrame()
 {
     int val = g_fence_value++;
@@ -344,6 +530,8 @@ const char* ToString(SceneLoadStage stage)
         return "Idle";
     case SceneLoadStage::kLoadingTrace:
         return "Loading trace";
+    case SceneLoadStage::kExtractingDispatchRays:
+        return "Extracting dispatch rays";
     case SceneLoadStage::kExtractingBlas:
         return "Extracting BLAS";
     case SceneLoadStage::kExtractingTlas:
@@ -352,12 +540,44 @@ const char* ToString(SceneLoadStage stage)
         return "Building GPU BLAS";
     case SceneLoadStage::kBuildingGpuTlas:
         return "Building GPU TLAS";
+    case SceneLoadStage::kBuildingCpuBvh:
+        return "Building CPU BVH";
     case SceneLoadStage::kReady:
         return "Ready";
     case SceneLoadStage::kFailed:
         return "Failed";
     default:
         return "Unknown";
+    }
+}
+
+const char* ToString(RenderBackend backend)
+{
+    switch (backend)
+    {
+    case RenderBackend::kDxr:
+        return "DXR";
+    case RenderBackend::kCpuBruteForce:
+        return "CPU brute force";
+    case RenderBackend::kCpuBvh:
+        return "CPU BVH";
+    default:
+        return "Unknown";
+    }
+}
+
+const char* ToString(CpuWorkerStage stage)
+{
+    switch (stage)
+    {
+    case CpuWorkerStage::kIdle:
+        return "idle";
+    case CpuWorkerStage::kBuildingBvh:
+        return "building BVH";
+    case CpuWorkerStage::kRendering:
+        return "rendering";
+    default:
+        return "unknown";
     }
 }
 
@@ -405,6 +625,594 @@ std::vector<InstanceInfo> ConvertSceneInstances(const SceneData& scene)
     return instances;
 }
 
+uint32_t InvocationRayBegin(const std::vector<uint32_t>& offsets, uint32_t invocation)
+{
+    return invocation == 0 ? 0 : offsets[invocation - 1];
+}
+
+uint32_t InvocationRayEnd(const std::vector<uint32_t>& offsets, const std::vector<RayInPixDumpFileMinimal>& rays, uint32_t invocation)
+{
+    return std::min<uint32_t>(offsets[invocation], static_cast<uint32_t>(rays.size()));
+}
+
+void ComputeRayOffsetStats(const std::vector<uint32_t>& offsets, uint32_t* active_pixels, uint32_t* max_rays_per_pixel)
+{
+    *active_pixels = 0;
+    *max_rays_per_pixel = 0;
+    uint32_t previous = 0;
+    for (uint32_t offset : offsets)
+    {
+        const uint32_t count = offset >= previous ? offset - previous : 0;
+        if (count > 0)
+        {
+            (*active_pixels)++;
+            *max_rays_per_pixel = std::max(*max_rays_per_pixel, count);
+        }
+        previous = offset;
+    }
+}
+
+const SceneDispatchRays* CurrentRraDispatch()
+{
+    if (g_scene_data.dispatches.empty())
+    {
+        return nullptr;
+    }
+    g_selected_dispatch_index = std::clamp(g_selected_dispatch_index, 0, static_cast<int>(g_scene_data.dispatches.size()) - 1);
+    return &g_scene_data.dispatches[g_selected_dispatch_index];
+}
+
+void RebuildDisplayDispatchRays()
+{
+    const SceneDispatchRays* dispatch = CurrentRraDispatch();
+
+    const std::vector<RayInPixDumpFileMinimal>* src_rays = nullptr;
+    const std::vector<uint32_t>* src_offsets = nullptr;
+    std::vector<uint32_t> pix_dump_offsets;
+    glm::uvec3 src_dims(0);
+    if (dispatch != nullptr)
+    {
+        src_rays = &dispatch->rays;
+        src_offsets = &dispatch->ray_offsets;
+        src_dims = dispatch->dispatch_dims;
+    }
+    else
+    {
+        src_rays = &g_rays_in_pix_dumpfile_minimal;
+        src_dims = g_ray_in_pix_dispatch_dims;
+        pix_dump_offsets.reserve(src_rays->size());
+        for (uint32_t i = 0; i < src_rays->size(); i++)
+        {
+            pix_dump_offsets.push_back(i + 1);
+        }
+        src_offsets = &pix_dump_offsets;
+    }
+
+    g_ray_in_pix_dispatch_dims = src_dims;
+    if (src_rays->empty() || src_offsets->empty() || RT_W <= 0 || RT_H <= 0)
+    {
+        g_display_ray_buffer.clear();
+        g_display_ray_offsets.assign(static_cast<size_t>(std::max(0, RT_W)) * static_cast<size_t>(std::max(0, RT_H)), 0);
+        g_display_ray_active_pixels = 0;
+        g_display_ray_max_rays_per_pixel = 0;
+        g_dispatch_ray_mapping_dirty = false;
+        g_dispatch_ray_gpu_dirty = true;
+        return;
+    }
+
+    const uint32_t dst_w = static_cast<uint32_t>(RT_W);
+    const uint32_t dst_h = static_cast<uint32_t>(RT_H);
+    const uint32_t dst_nr = dst_w * dst_h;
+    g_display_ray_buffer.clear();
+    g_display_ray_offsets.assign(dst_nr, 0);
+
+    if (static_cast<DispatchRayLayoutMode>(g_dispatch_ray_layout_mode) == DispatchRayLayoutMode::kReflowBlocks)
+    {
+        const uint32_t block_w = static_cast<uint32_t>(std::max(1, g_dispatch_reflow_block_w));
+        const uint32_t block_h = static_cast<uint32_t>(std::max(1, g_dispatch_reflow_block_h));
+        const uint32_t src_w = std::max(1u, src_dims.x);
+        const uint32_t src_h = std::max(1u, src_dims.y * std::max(1u, src_dims.z));
+        const uint32_t src_grid_x = (src_w + block_w - 1) / block_w;
+        const uint32_t src_grid_y = (src_h + block_h - 1) / block_h;
+        const uint32_t dst_grid_x = (dst_w + block_w - 1) / block_w;
+        const uint32_t dst_grid_y = (dst_h + block_h - 1) / block_h;
+        std::vector<std::pair<uint32_t, uint32_t>> dst_ranges(dst_nr);
+
+        uint32_t target_gx = 0;
+        uint32_t target_gy = 0;
+        for (uint32_t gy = 0; gy < src_grid_y; gy++)
+        {
+            for (uint32_t gx = 0; gx < src_grid_x; gx++)
+            {
+                bool has_work = false;
+                if (!g_dispatch_reflow_skip_empty)
+                {
+                    has_work = true;
+                }
+                else
+                {
+                    for (uint32_t ty = 0; ty < block_h && !has_work; ty++)
+                    {
+                        for (uint32_t tx = 0; tx < block_w; tx++)
+                        {
+                            const uint32_t sx = gx * block_w + tx;
+                            const uint32_t sy_flat = gy * block_h + ty;
+                            if (sx >= src_dims.x || sy_flat >= src_dims.y * src_dims.z)
+                            {
+                                continue;
+                            }
+                            const uint32_t sz = src_dims.y == 0 ? 0 : sy_flat / src_dims.y;
+                            const uint32_t sy = src_dims.y == 0 ? 0 : sy_flat % src_dims.y;
+                            const uint32_t src_invocation = sx + sy * src_dims.x + sz * src_dims.x * src_dims.y;
+                            const uint32_t lb = InvocationRayBegin(*src_offsets, src_invocation);
+                            const uint32_t ub = InvocationRayEnd(*src_offsets, *src_rays, src_invocation);
+                            if (ub > lb)
+                            {
+                                has_work = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!has_work || target_gy >= dst_grid_y)
+                {
+                    continue;
+                }
+
+                for (uint32_t ty = 0; ty < block_h; ty++)
+                {
+                    for (uint32_t tx = 0; tx < block_w; tx++)
+                    {
+                        const uint32_t sx = gx * block_w + tx;
+                        const uint32_t sy_flat = gy * block_h + ty;
+                        if (sx >= src_dims.x || sy_flat >= src_dims.y * src_dims.z)
+                        {
+                            continue;
+                        }
+                        const uint32_t dx = target_gx * block_w + tx;
+                        const uint32_t dy = target_gy * block_h + ty;
+                        if (dx >= dst_w || dy >= dst_h)
+                        {
+                            continue;
+                        }
+                        const uint32_t sz = src_dims.y == 0 ? 0 : sy_flat / src_dims.y;
+                        const uint32_t sy = src_dims.y == 0 ? 0 : sy_flat % src_dims.y;
+                        const uint32_t src_invocation = sx + sy * src_dims.x + sz * src_dims.x * src_dims.y;
+                        dst_ranges[dx + dy * dst_w] = std::make_pair(InvocationRayBegin(*src_offsets, src_invocation),
+                                                                      InvocationRayEnd(*src_offsets, *src_rays, src_invocation));
+                    }
+                }
+
+                target_gx++;
+                if (target_gx >= dst_grid_x)
+                {
+                    target_gx = 0;
+                    target_gy++;
+                }
+            }
+        }
+
+        uint32_t total_ray_count = 0;
+        for (uint32_t dst = 0; dst < dst_nr; dst++)
+        {
+            const auto [lb, ub] = dst_ranges[dst];
+            total_ray_count += ub > lb ? ub - lb : 0;
+            g_display_ray_offsets[dst] = total_ray_count;
+        }
+
+        g_display_ray_buffer.reserve(total_ray_count);
+        for (uint32_t dst = 0; dst < dst_nr; dst++)
+        {
+            const auto [lb, ub] = dst_ranges[dst];
+            if (ub > lb)
+            {
+                g_display_ray_buffer.insert(g_display_ray_buffer.end(), src_rays->begin() + lb, src_rays->begin() + ub);
+            }
+        }
+    }
+    else
+    {
+        std::vector<uint32_t> ray_counts(dst_nr, 0);
+        for (uint32_t z = 0; z < std::max(1u, src_dims.z); z++)
+        {
+            for (uint32_t y = 0; y < src_dims.y; y++)
+            {
+                for (uint32_t x = 0; x < src_dims.x; x++)
+                {
+                    const uint32_t src_invocation = x + y * src_dims.x + z * src_dims.x * src_dims.y;
+                    const uint32_t dst_x = std::min(x, dst_w - 1);
+                    const uint32_t dst_y = std::min(y + z * src_dims.y, dst_h - 1);
+                    const uint32_t lb = InvocationRayBegin(*src_offsets, src_invocation);
+                    const uint32_t ub = InvocationRayEnd(*src_offsets, *src_rays, src_invocation);
+                    if (ub > lb)
+                    {
+                        ray_counts[dst_x + dst_y * dst_w] += ub - lb;
+                    }
+                }
+            }
+        }
+
+        uint32_t total_ray_count = 0;
+        for (uint32_t dst = 0; dst < dst_nr; dst++)
+        {
+            total_ray_count += ray_counts[dst];
+            g_display_ray_offsets[dst] = total_ray_count;
+        }
+
+        g_display_ray_buffer.resize(total_ray_count);
+        std::vector<uint32_t> write_offsets = g_display_ray_offsets;
+        for (uint32_t dst = dst_nr; dst > 0; dst--)
+        {
+            write_offsets[dst - 1] = dst == 1 ? 0 : g_display_ray_offsets[dst - 2];
+        }
+        for (uint32_t z = 0; z < std::max(1u, src_dims.z); z++)
+        {
+            for (uint32_t y = 0; y < src_dims.y; y++)
+            {
+                for (uint32_t x = 0; x < src_dims.x; x++)
+                {
+                    const uint32_t src_invocation = x + y * src_dims.x + z * src_dims.x * src_dims.y;
+                    const uint32_t dst_x = std::min(x, dst_w - 1);
+                    const uint32_t dst_y = std::min(y + z * src_dims.y, dst_h - 1);
+                    const uint32_t dst = dst_x + dst_y * dst_w;
+                    const uint32_t lb = InvocationRayBegin(*src_offsets, src_invocation);
+                    const uint32_t ub = InvocationRayEnd(*src_offsets, *src_rays, src_invocation);
+                    if (ub > lb)
+                    {
+                        const uint32_t count = ub - lb;
+                        //std::copy(src_rays->begin() + lb, src_rays->begin() + ub, g_display_ray_buffer.begin() + write_offsets[dst]);
+                        memcpy(g_display_ray_buffer.data() + write_offsets[dst], src_rays->data() + lb, sizeof(RayInPixDumpFileMinimal) * count);
+                        write_offsets[dst] += count;
+                    }
+                }
+            }
+        }
+    }
+
+    ComputeRayOffsetStats(g_display_ray_offsets, &g_display_ray_active_pixels, &g_display_ray_max_rays_per_pixel);
+    g_dispatch_ray_mapping_dirty = false;
+    g_dispatch_ray_gpu_dirty = true;
+}
+
+void RebuildGpuDispatchRays()
+{
+    const SceneDispatchRays* dispatch = CurrentRraDispatch();
+    if (dispatch == nullptr)
+    {
+        g_gpu_dispatch_ray_buffer = g_rays_in_pix_dumpfile_minimal;
+        g_gpu_dispatch_ray_offsets.clear();
+        g_gpu_dispatch_ray_offsets.reserve(g_gpu_dispatch_ray_buffer.size());
+        for (uint32_t i = 0; i < g_gpu_dispatch_ray_buffer.size(); i++)
+        {
+            g_gpu_dispatch_ray_offsets.push_back(i + 1);
+        }
+        g_gpu_dispatch_ray_dims = g_ray_in_pix_dispatch_dims;
+    }
+    else if (static_cast<DispatchRayLayoutMode>(g_dispatch_ray_layout_mode) == DispatchRayLayoutMode::kReflowBlocks)
+    {
+        if (g_dispatch_ray_mapping_dirty)
+        {
+            RebuildDisplayDispatchRays();
+        }
+        g_gpu_dispatch_ray_buffer = g_display_ray_buffer;
+        g_gpu_dispatch_ray_offsets = g_display_ray_offsets;
+        g_gpu_dispatch_ray_dims = glm::uvec3(static_cast<uint32_t>(RT_W), static_cast<uint32_t>(RT_H), 1);
+    }
+    else
+    {
+        g_gpu_dispatch_ray_buffer = dispatch->rays;
+        g_gpu_dispatch_ray_offsets = dispatch->ray_offsets;
+        g_gpu_dispatch_ray_dims = dispatch->dispatch_dims;
+    }
+
+    ComputeRayOffsetStats(g_gpu_dispatch_ray_offsets, &g_gpu_dispatch_ray_active_pixels, &g_gpu_dispatch_ray_max_rays_per_pixel);
+    g_dispatch_ray_gpu_dirty = true;
+}
+
+std::vector<CpuRay> BuildCpuExternalRays()
+{
+    std::vector<CpuRay> rays;
+    rays.reserve(g_display_ray_buffer.size());
+    for (const auto& ray : g_display_ray_buffer)
+    {
+        CpuRay cpu_ray{};
+        cpu_ray.origin                  = ray.origin;
+        cpu_ray.direction               = ray.direction;
+        cpu_ray.tmin                    = ray.tmin;
+        cpu_ray.tmax                    = ray.tmax;
+        cpu_ray.ray_flags               = ray.ray_flags;
+        cpu_ray.instance_inclusion_mask = ray.instance_inclusion_mask;
+        rays.push_back(cpu_ray);
+    }
+    return rays;
+}
+
+uint32_t CurrentCpuBvhFanout()
+{
+    static constexpr uint32_t kFanouts[] = {2, 4, 6, 8, 10, 12, 16};
+    constexpr int fanout_count = static_cast<int>(sizeof(kFanouts) / sizeof(kFanouts[0]));
+    g_cpu_bvh_fanout_index = std::clamp(g_cpu_bvh_fanout_index, 0, fanout_count - 1);
+    return kFanouts[g_cpu_bvh_fanout_index];
+}
+
+CpuBvhSettings CurrentCpuBvhSettings()
+{
+    CpuBvhSettings settings{};
+    settings.fanout = CurrentCpuBvhFanout();
+    settings.build_mode =
+        (g_cpu_use_rra_topology && (settings.fanout == 4 || settings.fanout == 8))
+            ? CpuBvhBuildMode::kTranscribedRra
+            : CpuBvhBuildMode::kWideMedian;
+    settings.split_mode =
+        g_cpu_bvh_split_mode_index == 1 ? CpuBvhSplitMode::kBinnedSah : CpuBvhSplitMode::kEqualCounts;
+    settings.primitive_node_triangle_capacity =
+        static_cast<uint32_t>(std::clamp(g_cpu_primitive_node_triangle_capacity, 1, 3));
+    return settings;
+}
+
+void WriteCpuCheckerboard(CpuRenderResult* result)
+{
+    result->rgba.resize(static_cast<size_t>(result->width) * static_cast<size_t>(result->height) * 4);
+    for (uint32_t y = 0; y < result->height; y++)
+    {
+        for (uint32_t x = 0; x < result->width; x++)
+        {
+            const bool dark = ((x / 8) + (y / 8)) % 2 == 0;
+            uint8_t* pixel = result->rgba.data() + (static_cast<size_t>(x) + static_cast<size_t>(y) * result->width) * 4;
+            pixel[0] = dark ? 128 : 255;
+            pixel[1] = dark ? 128 : 255;
+            pixel[2] = dark ? 128 : 0;
+            pixel[3] = 255;
+        }
+    }
+}
+
+void PublishCpuCheckerboard(RenderBackend backend, uint64_t generation)
+{
+    std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+    g_cpu_display_tiles_completed = 0;
+    g_cpu_display_tiles_total = RT_W == 0 ? 0 : ((RT_W + 15) / 16) * ((RT_H + 15) / 16);
+    g_cpu_display_generation = 0;
+
+    CpuRenderResult checker{};
+    checker.width = RT_W;
+    checker.height = RT_H;
+    checker.tiles_completed = 0;
+    checker.tiles_total = g_cpu_display_tiles_total;
+    checker.generation = generation;
+    checker.complete = false;
+    checker.backend = backend;
+    WriteCpuCheckerboard(&checker);
+    g_latest_cpu_result = std::move(checker);
+}
+
+void QueueInitialCpuBvhBuild()
+{
+    CpuRenderRequest request{};
+    request.width = RT_W;
+    request.height = RT_H;
+    request.thread_count = static_cast<uint32_t>(std::max(1, g_cpu_thread_count));
+    request.inverse_view = g_inv_view;
+    request.inverse_proj = g_inv_proj;
+    request.invert_y = g_invert_y;
+    request.backend = RenderBackend::kCpuBvh;
+    request.generation = ++g_cpu_request_generation;
+    request.rebuild_bvh = true;
+    request.render_after_build = false;
+    request.bvh_settings = CurrentCpuBvhSettings();
+
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        if (g_cpu_worker_busy || g_cpu_request_pending)
+        {
+            return;
+        }
+        g_pending_cpu_request = std::move(request);
+        g_cpu_request_pending = true;
+    }
+    g_cpu_worker_cv.notify_one();
+}
+
+void QueueCpuRender()
+{
+    if (g_render_backend == RenderBackend::kDxr)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        if (!g_cpu_refresh_requested || g_cpu_request_pending || g_cpu_worker_busy)
+        {
+            return;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> renderer_lock(g_cpu_renderer_mutex);
+        if (!g_cpu_renderer.IsReady())
+        {
+            PublishCpuCheckerboard(g_render_backend, ++g_cpu_request_generation);
+            return;
+        }
+    }
+
+    if (g_dispatch_ray_mapping_dirty)
+    {
+        RebuildDisplayDispatchRays();
+    }
+
+    CpuRenderRequest request{};
+    request.width             = RT_W;
+    request.height            = RT_H;
+    request.thread_count      = static_cast<uint32_t>(std::max(1, g_cpu_thread_count));
+    request.inverse_view      = g_inv_view;
+    request.inverse_proj      = g_inv_proj;
+    request.invert_y          = g_invert_y;
+    request.use_external_rays = g_use_ray_in_pix;
+    request.backend           = g_render_backend;
+    request.generation        = ++g_cpu_request_generation;
+    request.rebuild_bvh       = g_render_backend == RenderBackend::kCpuBvh && g_cpu_bvh_rebuild_requested.load();
+    request.bvh_settings      = CurrentCpuBvhSettings();
+    request.external_rays     = BuildCpuExternalRays();
+    request.external_ray_offsets = g_display_ray_offsets;
+    const RenderBackend checker_backend = request.backend;
+    const uint64_t checker_generation = request.generation;
+
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        g_pending_cpu_request  = std::move(request);
+        g_cpu_request_pending  = true;
+        g_cpu_refresh_requested = false;
+        g_cpu_display_tiles_completed = 0;
+        g_cpu_display_tiles_total = g_pending_cpu_request->width == 0 ? 0 : ((g_pending_cpu_request->width + 15) / 16) * ((g_pending_cpu_request->height + 15) / 16);
+        g_cpu_display_generation = 0;
+    }
+    PublishCpuCheckerboard(checker_backend, checker_generation);
+    g_cpu_worker_cv.notify_one();
+}
+
+bool TryConsumeCpuRenderResult()
+{
+    std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+    if (!g_latest_cpu_result.has_value())
+    {
+        return false;
+    }
+    if (g_latest_cpu_result->generation < g_cpu_display_generation)
+    {
+        return false;
+    }
+    if (g_latest_cpu_result->backend != g_render_backend)
+    {
+        return false;
+    }
+    if (g_latest_cpu_result->generation == g_cpu_display_generation &&
+        g_latest_cpu_result->tiles_completed <= g_cpu_display_tiles_completed)
+    {
+        return false;
+    }
+    g_cpu_display_generation = g_latest_cpu_result->generation;
+    g_cpu_display_tiles_completed = g_latest_cpu_result->tiles_completed;
+    g_cpu_display_tiles_total = g_latest_cpu_result->tiles_total;
+    g_app_state.SetCpuRenderStats(g_latest_cpu_result->stats);
+    return true;
+}
+
+void UploadCpuRenderTarget()
+{
+    std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+    if (!g_latest_cpu_result.has_value())
+    {
+        return;
+    }
+
+    const CpuRenderResult& result = *g_latest_cpu_result;
+    if (result.backend != g_render_backend ||
+        result.rgba.empty() ||
+        result.width != static_cast<uint32_t>(RT_W) ||
+        result.height != static_cast<uint32_t>(RT_H))
+    {
+        return;
+    }
+
+    uint8_t* mapped = nullptr;
+    g_cpu_rt_upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+    for (UINT row = 0; row < static_cast<UINT>(RT_H); row++)
+    {
+        memcpy(mapped + g_cpu_rt_upload_footprint.Offset + row * g_cpu_rt_upload_footprint.Footprint.RowPitch,
+               result.rgba.data() + row * RT_W * 4,
+               static_cast<size_t>(RT_W) * 4);
+    }
+    g_cpu_rt_upload->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource        = g_rt_output_resource;
+    dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource       = g_cpu_rt_upload;
+    src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = g_cpu_rt_upload_footprint;
+
+    g_command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+}
+
+void CpuWorkerMain()
+{
+    while (true)
+    {
+        CpuRenderRequest request{};
+        {
+            std::unique_lock<std::mutex> lock(g_cpu_worker_mutex);
+            g_cpu_worker_cv.wait(lock, []() { return g_cpu_worker_exit || g_cpu_request_pending; });
+            if (g_cpu_worker_exit)
+            {
+                return;
+            }
+            request               = *g_pending_cpu_request;
+            g_cpu_request_pending = false;
+            g_cpu_worker_busy     = true;
+        }
+
+        if (request.rebuild_bvh)
+        {
+            g_cpu_worker_stage.store(CpuWorkerStage::kBuildingBvh);
+            g_app_state.scene_stage.store(SceneLoadStage::kBuildingCpuBvh);
+            g_app_state.SetStatus("Building CPU BVH");
+            {
+                std::lock_guard<std::mutex> renderer_lock(g_cpu_renderer_mutex);
+                g_cpu_renderer.BuildFromScene(g_scene_data, request.bvh_settings, &g_app_state);
+            }
+            g_cpu_bvh_settings = request.bvh_settings;
+            g_cpu_bvh_rebuild_requested.store(false);
+            g_app_state.scene_stage.store(SceneLoadStage::kReady);
+            g_app_state.SetStatus("CPU BVH ready");
+        }
+        if (!request.render_after_build)
+        {
+            std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+            g_cpu_worker_busy = false;
+            g_cpu_worker_stage.store(CpuWorkerStage::kIdle);
+            continue;
+        }
+
+        CpuRenderResult result{};
+        g_cpu_worker_stage.store(CpuWorkerStage::kRendering);
+        {
+            std::lock_guard<std::mutex> renderer_lock(g_cpu_renderer_mutex);
+            g_cpu_renderer.Render(
+                request,
+                &result,
+                [&](const CpuRenderResult& partial_result) {
+                    std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+                    if (!g_latest_cpu_result.has_value() ||
+                        partial_result.generation > g_latest_cpu_result->generation ||
+                        (partial_result.generation == g_latest_cpu_result->generation &&
+                         partial_result.tiles_completed >= g_latest_cpu_result->tiles_completed))
+                    {
+                        g_latest_cpu_result = partial_result;
+                    }
+                });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+            if (!g_latest_cpu_result.has_value() ||
+                result.generation > g_latest_cpu_result->generation ||
+                (result.generation == g_latest_cpu_result->generation &&
+                 result.tiles_completed >= g_latest_cpu_result->tiles_completed))
+            {
+                g_latest_cpu_result = std::move(result);
+            }
+            g_cpu_worker_busy = false;
+            g_cpu_worker_stage.store(CpuWorkerStage::kIdle);
+        }
+    }
+}
+
 void InitImGui()
 {
     IMGUI_CHECKVERSION();
@@ -444,11 +1252,25 @@ void DrawImGuiPanel()
     ImGui::NewFrame();
 
     SceneStats stats;
+    CpuRenderStats cpu_stats;
+    uint64_t cpu_bvh_node_count = 0;
+    uint64_t cpu_bvh_primitive_count = 0;
+    uint32_t cpu_bvh_fanout = 2;
+    uint32_t cpu_bvh_primitive_node_triangle_capacity = 3;
+    bool cpu_bvh_uses_rra_topology = false;
+    bool cpu_bvh_uses_binned_sah = false;
     std::string status_line;
     std::string last_error;
     {
         std::lock_guard<std::mutex> lock(g_app_state.details_mutex);
         stats       = g_app_state.scene_stats;
+        cpu_stats   = g_app_state.cpu_render_stats;
+        cpu_bvh_node_count = g_app_state.cpu_bvh_node_count;
+        cpu_bvh_primitive_count = g_app_state.cpu_bvh_primitive_count;
+        cpu_bvh_fanout = g_app_state.cpu_bvh_fanout;
+        cpu_bvh_primitive_node_triangle_capacity = g_app_state.cpu_bvh_primitive_node_triangle_capacity;
+        cpu_bvh_uses_rra_topology = g_app_state.cpu_bvh_uses_rra_topology;
+        cpu_bvh_uses_binned_sah = g_app_state.cpu_bvh_uses_binned_sah;
         status_line = g_app_state.status_line;
         last_error  = g_app_state.last_error;
     }
@@ -460,7 +1282,183 @@ void DrawImGuiPanel()
         ImGui::Text("Stage: %s", ToString(g_app_state.scene_stage.load()));
         ImGui::Text("GPU frame: %.3f ms", g_app_state.last_gpu_frame_ms);
         ImGui::Text("Render: %dx%d -> %dx%d", RT_W, RT_H, WIN_W, WIN_H);
+        ImGui::Text("Backend: %s", ToString(g_render_backend));
+        ImGui::Text("CPU worker: %s", ToString(g_cpu_worker_stage.load()));
+        ImGui::Text("CPU tiles done: %u / %u", g_cpu_display_tiles_completed, g_cpu_display_tiles_total);
         ImGui::Text("Mode: %s", g_use_ao ? "AO rays" : "Primary rays");
+        int backend = static_cast<int>(g_render_backend);
+        if (ImGui::Combo("Render path", &backend, "DXR\0CPU brute force\0CPU BVH\0"))
+        {
+            const RenderBackend new_backend = static_cast<RenderBackend>(backend);
+            if (new_backend != g_render_backend)
+            {
+                const bool cpu_backend_changed =
+                    new_backend != RenderBackend::kDxr &&
+                    g_render_backend != RenderBackend::kDxr &&
+                    new_backend != g_render_backend;
+                g_render_backend = new_backend;
+                if (cpu_backend_changed)
+                {
+                    g_cpu_refresh_requested = true;
+                    g_cpu_display_tiles_completed = 0;
+                    g_cpu_display_tiles_total = 0;
+                    g_app_state.SetCpuRenderStats({});
+                }
+            }
+            if (g_render_backend != RenderBackend::kDxr)
+            {
+                g_use_ao = false;
+            }
+        }
+        if (g_render_backend != RenderBackend::kDxr)
+        {
+            ImGui::InputInt("CPU threads", &g_cpu_thread_count, 1, 4);
+            if (g_cpu_thread_count < 1)
+            {
+                g_cpu_thread_count = 1;
+            }
+            if (g_render_backend == RenderBackend::kCpuBvh)
+            {
+                if (g_cpu_worker_busy)
+                {
+                    ImGui::BeginDisabled();
+                }
+                static const char* kFanoutLabels[] = {"2", "4", "6", "8", "10", "12", "16"};
+                if (ImGui::Combo("CPU BVH fanout", &g_cpu_bvh_fanout_index, kFanoutLabels, IM_ARRAYSIZE(kFanoutLabels)))
+                {
+                    g_cpu_bvh_rebuild_requested.store(true);
+                }
+
+                static const char* kSplitLabels[] = {"Equal counts", "Binned SAH"};
+                if (ImGui::Combo("CPU BVH split", &g_cpu_bvh_split_mode_index, kSplitLabels, IM_ARRAYSIZE(kSplitLabels)))
+                {
+                    g_cpu_bvh_rebuild_requested.store(true);
+                }
+                if (ImGui::InputInt("Primitive node tris", &g_cpu_primitive_node_triangle_capacity, 1, 1))
+                {
+                    g_cpu_primitive_node_triangle_capacity = std::clamp(g_cpu_primitive_node_triangle_capacity, 1, 3);
+                    g_cpu_bvh_rebuild_requested.store(true);
+                }
+
+                const uint32_t requested_fanout = CurrentCpuBvhFanout();
+                const bool can_transcribe_rra = requested_fanout == 4 || requested_fanout == 8;
+                if (!can_transcribe_rra)
+                {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Checkbox("Use RRA BVH topology", &g_cpu_use_rra_topology))
+                {
+                    g_cpu_bvh_rebuild_requested.store(true);
+                }
+                if (!can_transcribe_rra)
+                {
+                    ImGui::EndDisabled();
+                }
+                if (g_cpu_worker_busy)
+                {
+                    ImGui::EndDisabled();
+                }
+            }
+
+            if (g_cpu_worker_busy)
+            {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Refresh CPU"))
+            {
+                g_cpu_refresh_requested = true;
+                if (g_render_backend == RenderBackend::kCpuBvh)
+                {
+                    g_cpu_bvh_rebuild_requested.store(true);
+                }
+                g_cpu_display_tiles_completed = 0;
+                g_cpu_display_tiles_total = 0;
+                g_cpu_display_generation = 0;
+                g_app_state.SetCpuRenderStats({});
+                std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+                g_latest_cpu_result.reset();
+            }
+            if (g_cpu_worker_busy)
+            {
+                ImGui::EndDisabled();
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::Checkbox("Use dispatch rays", &g_use_ray_in_pix))
+        {
+            g_dispatch_ray_mapping_dirty = true;
+        }
+        const bool has_rra_dispatches = !g_scene_data.dispatches.empty();
+        if (g_use_ray_in_pix)
+        {
+            if (has_rra_dispatches)
+            {
+                std::vector<const char*> dispatch_names;
+                dispatch_names.reserve(g_scene_data.dispatches.size());
+                for (const auto& dispatch : g_scene_data.dispatches)
+                {
+                    dispatch_names.push_back(dispatch.name.c_str());
+                }
+                if (ImGui::Combo("RRA dispatch", &g_selected_dispatch_index, dispatch_names.data(), static_cast<int>(dispatch_names.size())))
+                {
+                    g_dispatch_ray_mapping_dirty = true;
+                }
+            }
+            else
+            {
+                ImGui::Text("RRA dispatches: none");
+            }
+
+            static const char* kDispatchLayoutLabels[] = {"Clamp to viewport", "Reflow blocks"};
+            if (ImGui::Combo("Ray layout", &g_dispatch_ray_layout_mode, kDispatchLayoutLabels, IM_ARRAYSIZE(kDispatchLayoutLabels)))
+            {
+                g_dispatch_ray_mapping_dirty = true;
+            }
+            static int reflow_block_w{8}, reflow_block_h{8};
+            static bool reflow_skip_empty{false};
+            if (static_cast<DispatchRayLayoutMode>(g_dispatch_ray_layout_mode) == DispatchRayLayoutMode::kReflowBlocks)
+            {
+                ImGui::Text("Reflow block ");
+                ImGui::SameLine();
+                ImGui::PushItemWidth(80);
+                if (ImGui::InputInt("##ReflowBlockW", &reflow_block_w, 1, 8))
+                {
+                    reflow_block_w               = std::max(1, reflow_block_w);
+                }
+                ImGui::PopItemWidth();
+                ImGui::SameLine();
+                ImGui::Text("x");
+                ImGui::SameLine();
+                ImGui::PushItemWidth(80);
+                if (ImGui::InputInt("##ReflowBlockH", &reflow_block_h, 1, 8))
+                {
+                    reflow_block_h               = std::max(1, reflow_block_h);
+                }
+                ImGui::PopItemWidth();
+                if (ImGui::Checkbox("Skip empty blocks", &reflow_skip_empty))
+                {
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Apply"))
+                {
+                    g_dispatch_ray_mapping_dirty = true;
+                    g_dispatch_reflow_block_w    = reflow_block_w;
+                    g_dispatch_reflow_block_h    = reflow_block_h;
+                    g_dispatch_reflow_skip_empty = reflow_skip_empty;
+                }
+            }
+            if (g_dispatch_ray_mapping_dirty)
+            {
+                RebuildDisplayDispatchRays();
+            }
+            ImGui::Text("Dispatch dims: %u x %u x %u", g_ray_in_pix_dispatch_dims.x, g_ray_in_pix_dispatch_dims.y, g_ray_in_pix_dispatch_dims.z);
+            ImGui::Text("CPU mapped rays: %zu", g_display_ray_buffer.size());
+            ImGui::Text("CPU active pixels: %u / %u", g_display_ray_active_pixels, RT_W * RT_H);
+            ImGui::Text("CPU max rays/pixel: %u", g_display_ray_max_rays_per_pixel);
+            ImGui::Text("GPU uploaded rays: %zu", g_gpu_dispatch_ray_buffer.size());
+            ImGui::Text("GPU active pixels: %u", g_gpu_dispatch_ray_active_pixels);
+            ImGui::Text("GPU max rays/pixel: %u", g_gpu_dispatch_ray_max_rays_per_pixel);
+        }
         if (g_use_ao)
         {
             ImGui::Text("AO samples: %d", g_ao_sample_count);
@@ -474,6 +1472,13 @@ void DrawImGuiPanel()
         const int blas_done  = static_cast<int>(g_app_state.blas_completed.load());
         const int tlas_total = static_cast<int>(g_app_state.tlas_total.load());
         const int tlas_done  = static_cast<int>(g_app_state.tlas_completed.load());
+        const int dispatch_total = static_cast<int>(g_app_state.dispatch_total.load());
+        const int dispatch_done  = static_cast<int>(g_app_state.dispatch_completed.load());
+        ImGui::Text("Dispatch rays progress: %d / %d", dispatch_done, dispatch_total);
+        if (dispatch_total > 0)
+        {
+            ImGui::ProgressBar(static_cast<float>(dispatch_done) / dispatch_total, ImVec2(-1.0f, 0.0f));
+        }
         ImGui::Text("BLAS progress: %d / %d", blas_done, blas_total);
         if (blas_total > 0)
         {
@@ -494,6 +1499,32 @@ void DrawImGuiPanel()
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", last_error.c_str());
         }
 
+        auto check_hover_stats = [&]() {
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::Text("Click to copy stats to clipboard");
+                ImGui::EndTooltip();
+                if (ImGui::IsItemClicked())
+                {
+                    // rays, nodes, boxnodes, ray-box, ray-tri, TLAS->BLAS, ShortStackReEntries
+                    char buf[200];
+                    snprintf(buf,
+                             sizeof(buf),
+                             "%llu, %llu, %llu, %llu, %llu, %llu, %llu",
+                             cpu_stats.rays,
+                             cpu_stats.bvh_steps,
+                             cpu_stats.box_nodes,
+                             cpu_stats.ray_box_tests,
+                             cpu_stats.ray_triangle_tests,
+                             cpu_stats.tlas_to_blas,
+                             0ULL);
+                    CopyToClipboard(std::string(buf));
+                }
+            }
+          
+        };
+
         ImGui::Separator();
         ImGui::Text("Scene source: %s", stats.source_name.empty() ? "<none>" : stats.source_name.c_str());
         ImGui::Text("Camera preset: %s", stats.camera_preset.empty() ? "<default>" : stats.camera_preset.c_str());
@@ -501,6 +1532,34 @@ void DrawImGuiPanel()
         ImGui::Text("BLAS: %llu", stats.blas_count);
         ImGui::Text("Instances: %llu", stats.instance_count);
         ImGui::Text("Triangles: %llu", stats.total_triangle_count);
+        ImGui::Text("CPU BVH prims: %llu", cpu_bvh_primitive_count);
+        ImGui::Text("CPU BVH nodes: %llu", cpu_bvh_node_count);
+        ImGui::Text("CPU BVH fanout: %u", cpu_bvh_fanout);
+        ImGui::Text("CPU primitive node tris: %u", cpu_bvh_primitive_node_triangle_capacity);
+        ImGui::Text("CPU BVH source: %s",
+                    cpu_bvh_uses_rra_topology ? "RRA topology" : (cpu_bvh_uses_binned_sah ? "binned SAH collapsed" : "equal-count wide"));
+        ImGui::Separator();
+        ImGui::Text("CPU rays: %llu", cpu_stats.rays);
+        check_hover_stats();
+        ImGui::Text("CPU traversal steps: %llu", cpu_stats.bvh_steps);
+        check_hover_stats();
+        ImGui::Text("CPU box nodes: %llu", cpu_stats.box_nodes);
+        check_hover_stats();
+        ImGui::Text("CPU ray-box tests: %llu (%.2f/node)", cpu_stats.ray_box_tests, cpu_stats.ray_box_tests * 1.0f / cpu_stats.box_nodes);
+        check_hover_stats();
+        ImGui::Text("CPU tri nodes: %llu", cpu_stats.tri_nodes);
+        check_hover_stats();
+        ImGui::Text("CPU ray-tri tests: %llu (%.2f/node)", cpu_stats.ray_triangle_tests, cpu_stats.ray_triangle_tests * 1.0f / cpu_stats.tri_nodes);
+        check_hover_stats();
+        ImGui::Text("CPU TLAS->BLAS: %llu", cpu_stats.tlas_to_blas);
+        check_hover_stats();
+        if (cpu_stats.rays > 0)
+        {
+            ImGui::Text("avg BVH steps/ray: %.3f", static_cast<double>(cpu_stats.bvh_steps) / static_cast<double>(cpu_stats.rays));
+            ImGui::Text("avg box tests/ray: %.3f", static_cast<double>(cpu_stats.ray_box_tests) / static_cast<double>(cpu_stats.rays));
+            ImGui::Text("avg tri tests/ray: %.3f", static_cast<double>(cpu_stats.ray_triangle_tests) / static_cast<double>(cpu_stats.rays));
+            ImGui::Text("avg TLAS->BLAS/ray: %.3f", static_cast<double>(cpu_stats.tlas_to_blas) / static_cast<double>(cpu_stats.rays));
+        }
         ImGui::Text("AABB min: %.3f %.3f %.3f", stats.scene_aabb_min.x, stats.scene_aabb_min.y, stats.scene_aabb_min.z);
         ImGui::Text("AABB max: %.3f %.3f %.3f", stats.scene_aabb_max.x, stats.scene_aabb_max.y, stats.scene_aabb_max.z);
     }
@@ -594,21 +1653,50 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         }
         case GLFW_KEY_1:
         {
+            g_render_backend = RenderBackend::kDxr;
             g_use_ao = true;
             g_use_ray_binning = false;
             break;
         }
         case GLFW_KEY_0: {
+            g_render_backend = RenderBackend::kDxr;
             g_use_ao = false;
             break;
         }
         case GLFW_KEY_3:
         case GLFW_KEY_2:
         {
+            g_render_backend = RenderBackend::kDxr;
             g_ao_sample_count = 1;
             g_use_ao          = true;
             g_use_ray_binning = key - GLFW_KEY_0;
             g_ray_mapping_dirty = true;
+            break;
+        }
+        case GLFW_KEY_4:
+        {
+            if (g_render_backend != RenderBackend::kCpuBruteForce)
+            {
+                g_cpu_refresh_requested = true;
+                g_cpu_display_tiles_completed = 0;
+                g_cpu_display_tiles_total = 0;
+                g_app_state.SetCpuRenderStats({});
+            }
+            g_render_backend = RenderBackend::kCpuBruteForce;
+            g_use_ao         = false;
+            break;
+        }
+        case GLFW_KEY_5:
+        {
+            if (g_render_backend != RenderBackend::kCpuBvh)
+            {
+                g_cpu_refresh_requested = true;
+                g_cpu_display_tiles_completed = 0;
+                g_cpu_display_tiles_total = 0;
+                g_app_state.SetCpuRenderStats({});
+            }
+            g_render_backend = RenderBackend::kCpuBvh;
+            g_use_ao         = false;
             break;
         }
         case GLFW_KEY_UP:
@@ -629,6 +1717,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             if (g_benchmarkState == BenchmarkState::NOT_STARTED)
             {
+                g_render_backend = RenderBackend::kDxr;
                 g_benchmarkState = BenchmarkState::BENCHMARKING;
                 g_ao_sample_count = 0;
                 g_use_ao          = true;
@@ -663,6 +1752,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         case GLFW_KEY_P:
         {
             g_use_ray_in_pix = !g_use_ray_in_pix;
+            g_dispatch_ray_mapping_dirty = true;
             printf("g_use_ray_in_pix = %d\n", g_use_ray_in_pix);
             break;
         }
@@ -863,6 +1953,30 @@ void InitDX12Stuff()
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rt_output_resource)));
     g_rt_output_resource->SetName(L"RT output resource");
 
+    g_device12->GetCopyableFootprints(&desc, 0, 1, 0, &g_cpu_rt_upload_footprint, &g_cpu_rt_upload_num_rows, &g_cpu_rt_upload_row_size, &g_cpu_rt_upload_total_size);
+    D3D12_RESOURCE_DESC upload_desc{};
+    upload_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    upload_desc.Alignment          = 0;
+    upload_desc.Width              = g_cpu_rt_upload_total_size;
+    upload_desc.Height             = 1;
+    upload_desc.DepthOrArraySize   = 1;
+    upload_desc.MipLevels          = 1;
+    upload_desc.Format             = DXGI_FORMAT_UNKNOWN;
+    upload_desc.SampleDesc.Count   = 1;
+    upload_desc.SampleDesc.Quality = 0;
+    upload_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    upload_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_HEAP_PROPERTIES upload_props{};
+    upload_props.Type                 = D3D12_HEAP_TYPE_UPLOAD;
+    upload_props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    upload_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    upload_props.CreationNodeMask     = 1;
+    upload_props.VisibleNodeMask      = 1;
+    CE(g_device12->CreateCommittedResource(
+        &upload_props, D3D12_HEAP_FLAG_NONE, &upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cpu_rt_upload)));
+    g_cpu_rt_upload->SetName(L"CPU RT upload");
+
     // Hit position in world space
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Format    = DXGI_FORMAT_UNKNOWN;
@@ -900,67 +2014,14 @@ void InitDX12Stuff()
 
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 9;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix
+    heap_desc.NumDescriptors = 10;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix, [9]=RayEntryOffsets
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
     g_srv_uav_cbv_heap->SetName(L"SRV UAV CBV heap");
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    
-    if (g_rays_in_pix_dumpfile_minimal.size() > 0)
-    {
-        D3D12_RESOURCE_DESC res_desc{};
-        res_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
-        res_desc.Alignment          = 0;
-        res_desc.Height             = 1;
-        res_desc.DepthOrArraySize   = 1;
-        res_desc.MipLevels          = 1;
-        res_desc.Format             = DXGI_FORMAT_UNKNOWN;
-        res_desc.SampleDesc.Count   = 1;
-        res_desc.SampleDesc.Quality = 0;
-        res_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        res_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
-        res_desc.Width              = sizeof(RayInPixDumpFileMinimal) * g_rays_in_pix_dumpfile_minimal.size();
-        CE(g_device12->CreateCommittedResource(
-            &props1, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer_upload)));
-        CE(g_device12->CreateCommittedResource(
-            &props, D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_rays_in_pix_buffer)));
-
-        char* mapped;
-        g_rays_in_pix_buffer_upload->Map(0, nullptr, (void**)(&mapped));
-        memcpy(mapped, g_rays_in_pix_dumpfile_minimal.data(), res_desc.Width);
-        g_rays_in_pix_buffer_upload->Unmap(0, nullptr);
-
-        g_command_list1->Reset(g_command_allocator1, nullptr);
-
-        g_command_list1->CopyResource(g_rays_in_pix_buffer, g_rays_in_pix_buffer_upload);
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource   = g_rays_in_pix_buffer;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-        barrier.Transition.Subresource = 0;
-        g_command_list1->ResourceBarrier(1, &barrier);
-
-        g_command_list1->Close();
-        g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)(&g_command_list1));
-
-        // SRV of RT output resource
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-        srv_desc.Buffer.FirstElement        = 0;
-        srv_desc.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_NONE;
-        srv_desc.Buffer.NumElements         = g_rays_in_pix_dumpfile_minimal.size();
-        srv_desc.Buffer.StructureByteStride = sizeof(RayInPixDumpFileMinimal);
-        srv_desc.Format                     = DXGI_FORMAT_UNKNOWN;
-        srv_desc.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
-
-        D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
-        handle.ptr = g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 8 * g_srv_uav_cbv_descriptor_size;
-        g_device12->CreateShaderResourceView(g_rays_in_pix_buffer, &srv_desc, handle);
-    }
+    UpdateDispatchRayGpuBuffers();
 
     // Query heap
     D3D12_QUERY_HEAP_DESC qhd{};
@@ -1210,8 +2271,8 @@ void CreateRTPipeline()
 
         // For PIX rays specifically
         D3D12_DESCRIPTOR_RANGE desc_ranges1[1]{};
-        desc_ranges1[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // Verts and InstanceOffsets
-        desc_ranges1[0].NumDescriptors                    = 1;
+        desc_ranges1[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // RaysInPix and RayEntryOffsets
+        desc_ranges1[0].NumDescriptors                    = 2;
         desc_ranges1[0].BaseShaderRegister                = 3;
         desc_ranges1[0].RegisterSpace                     = 0;
         desc_ranges1[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1539,7 +2600,17 @@ void CreateShaderBindingTable()
 
 void Render()
 {
+    if (g_render_backend != RenderBackend::kDxr)
+    {
+        QueueCpuRender();
+        TryConsumeCpuRenderResult();
+    }
+
     DrawImGuiPanel();
+    if (g_use_ray_in_pix && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty))
+    {
+        UpdateDispatchRayGpuBuffers();
+    }
 
     // Update
     char* mapped;
@@ -1552,9 +2623,9 @@ void Render()
     cb.use_ray_binning = g_use_ray_binning;
     cb.ao_radius       = g_ao_radius;
     cb.load_ray_from_buffer = g_use_ray_in_pix;
-    cb.buffer_w             = g_ray_in_pix_dispatch_dims.x;
-    cb.buffer_h             = g_ray_in_pix_dispatch_dims.y;
-    cb.buffer_d             = g_ray_in_pix_dispatch_dims.z;
+    cb.buffer_w             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.x : g_ray_in_pix_dispatch_dims.x;
+    cb.buffer_h             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.y : g_ray_in_pix_dispatch_dims.y;
+    cb.buffer_d             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.z : g_ray_in_pix_dispatch_dims.z;
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 
@@ -1581,159 +2652,155 @@ void Render()
     {
         D3D12_RESOURCE_BARRIER barrier_rt_out = barrier_rtv;
         barrier_rt_out.Transition.pResource   = g_rt_output_resource;
-        barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        g_command_list->ResourceBarrier(1, &barrier_rt_out);
 
-        g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
-
-        // Dispatch ray
-        D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
-        D3D12_GPU_DESCRIPTOR_HANDLE pix_rays_dump_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
-        pix_rays_dump_handle.ptr += 8 * g_srv_uav_cbv_descriptor_size;
-
-        D3D12_RESOURCE_BARRIER hitpos_barrier{};
-        hitpos_barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        hitpos_barrier.Transition.pResource   = g_hitpos_ao;
-        hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
-        hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-        D3D12_DISPATCH_RAYS_DESC desc{};
-        if (g_use_ao == false)
+        if (g_render_backend == RenderBackend::kDxr)
         {
-            g_command_list->SetComputeRootSignature(g_global_rootsig);
-            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
-            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
-            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
-            g_command_list->SetPipelineState1(g_rt_state_object);
-            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
-            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
-            desc.MissShaderTable.SizeInBytes            = 64;
-            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
-            desc.HitGroupTable.SizeInBytes              = 64;
-            desc.Width                                  = RT_W;
-            desc.Height                                 = RT_H;
-            desc.Depth                                  = 1;
-            g_command_list->DispatchRays(&desc);
-        }
-        else
-        {
-            g_command_list->SetComputeRootSignature(g_global_rootsig_ao);
-            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
-            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
-            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
-            g_command_list->SetPipelineState1(g_rt_state_object_ao);
+            barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            g_command_list->ResourceBarrier(1, &barrier_rt_out);
 
-            g_command_list->ResourceBarrier(1, &hitpos_barrier);
+            g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
-            if (g_force_hitpos_dirty)
+            D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+            D3D12_GPU_DESCRIPTOR_HANDLE pix_rays_dump_handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+            pix_rays_dump_handle.ptr += 8 * g_srv_uav_cbv_descriptor_size;
+
+            D3D12_RESOURCE_BARRIER hitpos_barrier{};
+            hitpos_barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            hitpos_barrier.Transition.pResource   = g_hitpos_ao;
+            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+            D3D12_DISPATCH_RAYS_DESC desc{};
+            if (g_use_ao == false)
             {
-                g_hitpos_dirty = true;
-            }
-            if (g_hitpos_dirty)
-            {
-                // Primary Rays
-                desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
+                g_command_list->SetComputeRootSignature(g_global_rootsig);
+                g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
+                g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+                g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                g_command_list->SetPipelineState1(g_rt_state_object);
+                desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
                 desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-                desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
+                desc.MissShaderTable.StartAddress           = g_miss_sbt_storage->GetGPUVirtualAddress();
                 desc.MissShaderTable.SizeInBytes            = 64;
-                desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress();
+                desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
                 desc.HitGroupTable.SizeInBytes              = 64;
                 desc.Width                                  = RT_W;
                 desc.Height                                 = RT_H;
                 desc.Depth                                  = 1;
                 g_command_list->DispatchRays(&desc);
+            }
+            else
+            {
+                g_command_list->SetComputeRootSignature(g_global_rootsig_ao);
+                g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
+                g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+                g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                g_command_list->SetPipelineState1(g_rt_state_object_ao);
 
-                D3D12_RESOURCE_BARRIER uav_barrier{};
-                uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                uav_barrier.UAV.pResource = g_hitpos_ao;
-                g_command_list->ResourceBarrier(1, &uav_barrier);
+                g_command_list->ResourceBarrier(1, &hitpos_barrier);
 
-                g_hitpos_dirty = false;
+                if (g_force_hitpos_dirty)
+                {
+                    g_hitpos_dirty = true;
+                }
+                if (g_hitpos_dirty)
+                {
+                    desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress();
+                    desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+                    desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress();
+                    desc.MissShaderTable.SizeInBytes            = 64;
+                    desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress();
+                    desc.HitGroupTable.SizeInBytes              = 64;
+                    desc.Width                                  = RT_W;
+                    desc.Height                                 = RT_H;
+                    desc.Depth                                  = 1;
+                    g_command_list->DispatchRays(&desc);
+
+                    D3D12_RESOURCE_BARRIER uav_barrier{};
+                    uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    uav_barrier.UAV.pResource = g_hitpos_ao;
+                    g_command_list->ResourceBarrier(1, &uav_barrier);
+
+                    g_hitpos_dirty = false;
+                }
+
+                desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+                desc.RayGenerationShaderRecord.SizeInBytes  = 64;
+                desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+                desc.MissShaderTable.SizeInBytes            = 64;
+                desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress() + 64;
+                desc.HitGroupTable.SizeInBytes              = 64;
+                desc.Width                                  = RT_W;
+                desc.Height                                 = RT_H;
+                desc.Depth                                  = 1;
+                g_command_list->DispatchRays(&desc);
             }
 
-            // AO Rays
-            desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage_ao->GetGPUVirtualAddress() + 64;
-            desc.RayGenerationShaderRecord.SizeInBytes  = 64;
-            desc.MissShaderTable.StartAddress           = g_miss_sbt_storage_ao->GetGPUVirtualAddress() + 64;
-            desc.MissShaderTable.SizeInBytes            = 64;
-            desc.HitGroupTable.StartAddress             = g_hit_sbt_storage_ao->GetGPUVirtualAddress() + 64;
-            desc.HitGroupTable.SizeInBytes              = 64;
-            desc.Width                                  = RT_W;
-            desc.Height                                 = RT_H;
-            desc.Depth                                  = 1;
-            g_command_list->DispatchRays(&desc);
-        }
+            g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            g_command_list->ResolveQueryData(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g_query_readback_buffer, 0);
 
-        g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-        g_command_list->ResolveQueryData(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g_query_readback_buffer, 0);
+            if (g_use_ao)
+            {
+                hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                g_command_list->ResourceBarrier(1, &hitpos_barrier);
 
-        if (g_use_ao)
-        {
+                g_command_list->CopyResource(g_hitpos_ao_readback, g_hitpos_ao);
 
-            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            g_command_list->ResourceBarrier(1, &hitpos_barrier);
+                hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+                g_command_list->ResourceBarrier(1, &hitpos_barrier);
+            }
 
-            g_command_list->CopyResource(g_hitpos_ao_readback, g_hitpos_ao);
-
-            hitpos_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            hitpos_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-            g_command_list->ResourceBarrier(1, &hitpos_barrier);
-        }
-
-        if (0)  // COPY
-        {
-            barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            g_command_list->ResourceBarrier(1, &barrier_rt_out);
-
-            barrier_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier_rtv.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_command_list->ResourceBarrier(1, &barrier_rtv);
-
-            g_command_list->CopyResource(g_rendertargets[g_frame_index], g_rt_output_resource);
-
-        }
-        else  // FSQUAD
-        {
             barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             g_command_list->ResourceBarrier(1, &barrier_rt_out);
+        }
+        else
+        {
+            g_app_state.last_gpu_frame_ms = 0.0f;
 
-            g_command_list->SetGraphicsRootSignature(g_rootsig_fsquad);
-            g_command_list->SetPipelineState(g_pipeline_fsquad);
-            g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap_fsquad);
-            D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_fsquad_handle(g_srv_uav_cbv_heap_fsquad->GetGPUDescriptorHandleForHeapStart());
-            g_command_list->SetGraphicsRootDescriptorTable(0, srv_uav_cbv_fsquad_handle);
-
-            D3D12_VIEWPORT viewport{};
-            viewport.TopLeftX = 0;
-            viewport.TopLeftY = 0;
-            viewport.Width    = WIN_W;
-            viewport.Height   = WIN_H;
-            viewport.MinDepth = 0;
-            viewport.MaxDepth = 1;
-
-            D3D12_RECT scissor{};
-            scissor.left   = 0;
-            scissor.top    = 0;
-            scissor.right  = WIN_W;
-            scissor.bottom = WIN_H;
-            g_command_list->RSSetViewports(1, &viewport);
-            g_command_list->RSSetScissorRects(1, &scissor);
-
-            g_command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_command_list->IASetVertexBuffers(0, 1, &g_fsquad_vbv);
-
-            g_command_list->OMSetRenderTargets(1, &handle_rtv, false, nullptr);
-            g_command_list->DrawInstanced(3, 1, 0, 0);
-
-            barrier_rt_out.Transition.StateBefore  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier_rt_out.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_command_list->ResourceBarrier(1, &barrier_rt_out);
+            UploadCpuRenderTarget();
+            barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             g_command_list->ResourceBarrier(1, &barrier_rt_out);
         }
+
+        g_command_list->SetGraphicsRootSignature(g_rootsig_fsquad);
+        g_command_list->SetPipelineState(g_pipeline_fsquad);
+        g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap_fsquad);
+        D3D12_GPU_DESCRIPTOR_HANDLE srv_uav_cbv_fsquad_handle(g_srv_uav_cbv_heap_fsquad->GetGPUDescriptorHandleForHeapStart());
+        g_command_list->SetGraphicsRootDescriptorTable(0, srv_uav_cbv_fsquad_handle);
+
+        D3D12_VIEWPORT viewport{};
+        viewport.TopLeftX = 0;
+        viewport.TopLeftY = 0;
+        viewport.Width    = static_cast<float>(WIN_W);
+        viewport.Height   = static_cast<float>(WIN_H);
+        viewport.MinDepth = 0;
+        viewport.MaxDepth = 1;
+
+        D3D12_RECT scissor{};
+        scissor.left   = 0;
+        scissor.top    = 0;
+        scissor.right  = WIN_W;
+        scissor.bottom = WIN_H;
+        g_command_list->RSSetViewports(1, &viewport);
+        g_command_list->RSSetScissorRects(1, &scissor);
+
+        g_command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_command_list->IASetVertexBuffers(0, 1, &g_fsquad_vbv);
+
+        g_command_list->OMSetRenderTargets(1, &handle_rtv, false, nullptr);
+        g_command_list->DrawInstanced(3, 1, 0, 0);
+
+        barrier_rt_out.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier_rt_out.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_command_list->ResourceBarrier(1, &barrier_rt_out);
     }
 
     g_command_list->OMSetRenderTargets(1, &handle_rtv, false, nullptr);
@@ -1751,7 +2818,7 @@ void Render()
     CE(g_command_allocator->Reset());
 
     // Read back ray dirs
-    if (g_use_ray_binning > 0)
+    if (g_render_backend == RenderBackend::kDxr && g_use_ray_binning > 0)
     {
         if (g_ray_mapping_dirty)
         {
@@ -1945,16 +3012,22 @@ void Render()
     }
 
     // Read timer
-    uint64_t freq{0};
-    g_command_queue->GetTimestampFrequency(&freq);
+    float frame_time_ms = 0.0f;
+    if (g_render_backend == RenderBackend::kDxr)
+    {
+        uint64_t freq{0};
+        g_command_queue->GetTimestampFrequency(&freq);
 
-    uint64_t timestamps[2];
-    g_query_readback_buffer->Map(0, nullptr, (void**)(&mapped));
-    memcpy(timestamps, mapped, 2 * sizeof(uint64_t));
-    g_query_readback_buffer->Unmap(0, nullptr);
-    float sec = (timestamps[1] - timestamps[0]) * 1.0f / freq;
+        uint64_t timestamps[2];
+        g_query_readback_buffer->Map(0, nullptr, (void**)(&mapped));
+        memcpy(timestamps, mapped, 2 * sizeof(uint64_t));
+        g_query_readback_buffer->Unmap(0, nullptr);
+        float sec = (timestamps[1] - timestamps[0]) * 1.0f / freq;
 
-    g_frame_time.AddSample(sec);
+        g_frame_time.AddSample(sec);
+        frame_time_ms = g_frame_time.GetFrameTime() * 1000.0f;
+        g_app_state.last_gpu_frame_ms = frame_time_ms;
+    }
     if (g_frame_time.ShouldUpdate())
     {
         std::stringstream ss;
@@ -1993,9 +3066,10 @@ void Render()
                 }
             }
 
-            ss << "MyRRAPlayground Render res " << std::to_string(RT_W) << "x" << std::to_string(RT_H) << " ";
-            ss << std::setprecision(4) << (g_frame_time.GetFrameTime() * 1000) << "ms/frame";
-            if (g_use_ao)
+            ss << "MyRRAPlayground [" << ToString(g_render_backend) << "] ";
+            ss << "Render res " << std::to_string(RT_W) << "x" << std::to_string(RT_H) << " ";
+            ss << std::setprecision(4) << frame_time_ms << "ms/frame";
+            if (g_render_backend == RenderBackend::kDxr && g_use_ao)
             {
                 ss << " AO rays, " << g_ao_sample_count << " samples";
             }
@@ -2011,7 +3085,6 @@ void Render()
             {
                 ss << " ray_binning=" << std::to_string(g_use_ray_binning);
             }
-            g_app_state.last_gpu_frame_ms = g_frame_time.GetFrameTime() * 1000.0f;
             glfwSetWindowTitle(g_window, ss.str().c_str());
         }
     }
@@ -2386,6 +3459,8 @@ void CreateAS(const std::vector<std::vector<Vertex>>& vertices, const std::vecto
 void LoadSceneAndCreateAS(bool rra_file_exists)
 {
     g_app_state.scene_stage.store(SceneLoadStage::kIdle);
+    g_app_state.dispatch_completed.store(0);
+    g_app_state.dispatch_total.store(0);
     g_app_state.SetStatus("Preparing scene");
 
     SceneData scene;
@@ -2403,24 +3478,44 @@ void LoadSceneAndCreateAS(bool rra_file_exists)
         g_app_state.scene_loaded.store(true);
         g_app_state.blas_total.store(static_cast<uint32_t>(scene.blas_vertices.size()));
         g_app_state.tlas_total.store(1);
+        g_app_state.dispatch_completed.store(0);
+        g_app_state.dispatch_total.store(0);
         g_app_state.SetStatus("Using fallback cube scene");
     }
 
-    g_scene_data     = scene;
     g_scene_aabb_min = scene.stats.scene_aabb_min;
     g_scene_aabb_max = scene.stats.scene_aabb_max;
+    g_selected_dispatch_index = 0;
+    g_dispatch_ray_mapping_dirty = true;
+    g_dispatch_ray_gpu_dirty = true;
     ApplySceneCamera(scene);
 
     CreateAS(ConvertSceneVertices(scene), ConvertSceneInstances(scene));
+    g_cpu_bvh_settings = CurrentCpuBvhSettings();
+    g_cpu_bvh_rebuild_requested.store(true);
+    g_app_state.SetCpuRenderStats({});
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        g_latest_cpu_result.reset();
+        g_pending_cpu_request.reset();
+        g_cpu_request_pending = false;
+        g_cpu_display_tiles_completed = 0;
+        g_cpu_display_tiles_total = 0;
+        g_cpu_display_generation = 0;
+    }
+    g_cpu_refresh_requested = true;
+    g_scene_data = std::move(scene);
 
     g_app_state.scene_stage.store(SceneLoadStage::kReady);
     g_app_state.as_built.store(true);
-    g_app_state.SetStatus("Scene ready");
+    g_app_state.SetStatus("DXR scene ready");
+    QueueInitialCpuBvhBuild();
 }
 
 void ReadPixBufferDump(const char* filename)
 {
     g_rays_in_pix_dumpfile_minimal.clear();
+    g_ray_in_pix_dispatch_dims = glm::uvec3(0);
     printf("Will print a pix buffer dump, named %s\n", filename);
     std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
     if (!ifs.good())
@@ -2470,8 +3565,10 @@ void ReadPixBufferDump(const char* filename)
         RayInPixDumpFileMinimal r1{};
         r1.origin                    = r.origin;
         r1.direction                 = r.direction;
-        r1.tcurrent                  = r.tcurrent;
+        r1.tmax                      = r.tcurrent;
         r1.tmin                      = r.tmin;
+        r1.ray_flags                 = r.ray_flags;
+        r1.instance_inclusion_mask   = 0xFF;
         g_ray_in_pix_dispatch_dims.x = std::max(g_ray_in_pix_dispatch_dims.x, r.dispatch_rays_idx.x + 1);
         g_ray_in_pix_dispatch_dims.y = std::max(g_ray_in_pix_dispatch_dims.y, r.dispatch_rays_idx.y + 1);
         g_ray_in_pix_dispatch_dims.z = std::max(g_ray_in_pix_dispatch_dims.z, r.dispatch_rays_idx.z + 1);
@@ -2479,6 +3576,8 @@ void ReadPixBufferDump(const char* filename)
     }
 
     fclose(f);
+    g_dispatch_ray_mapping_dirty = true;
+    g_dispatch_ray_gpu_dirty = true;
     printf("Read %zu rays\n", g_rays_in_pix_dumpfile_minimal.size());
 }
 
@@ -2533,6 +3632,7 @@ int main(int argc, char** argv)
     InitSwapChain();
     InitDX12Stuff();
     InitImGui();
+    g_cpu_worker_thread = std::thread(CpuWorkerMain);
 
     CreateRTPipeline();
     CreateShaderBindingTable();
@@ -2548,6 +3648,15 @@ int main(int argc, char** argv)
     }
 
     thd.join();
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        g_cpu_worker_exit = true;
+    }
+    g_cpu_worker_cv.notify_one();
+    if (g_cpu_worker_thread.joinable())
+    {
+        g_cpu_worker_thread.join();
+    }
     ShutdownImGui();
 
     return 0;

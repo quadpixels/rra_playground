@@ -9,8 +9,15 @@ set(CMAKE_CONFIGURATION_TYPES "Release;Debug")
 
 set(CMAKE_CXX_STANDARD 20)
 
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/glfw)
+
 add_executable(MyRRALoader
   main.cpp
+  cpu_renderer.cpp
   scene.cpp
   third_party/imgui/imgui.cpp
   third_party/imgui/imgui_draw.cpp
@@ -23,7 +30,7 @@ include_directories(AFTER
   ${CMAKE_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/third_party/imgui
   ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
-  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/include
+  ${CMAKE_SOURCE_DIR}/third_party/glfw/include
   ${RRA_PATH}/external/third_party
   ${RRA_PATH}/external/third_party/glm
   ${RRA_PATH}/source/backend
@@ -39,7 +46,7 @@ target_link_libraries(MyRRALoader debug
   ${RRA_PATH}/build/win/vs2022/external/rdf/rdf/Debug/amdrdf-d.lib
   ${RRA_PATH}/build/win/vs2022/external/rdf/imported/zstd/Debug/zstd-d.lib
   ${RRA_PATH}/build/win/vs2022/external/system_info_utils/source/Debug/system_info-d.lib
-  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/lib-vc2010-64/glfw3.lib
+  glfw
   dxcompiler.lib
 )
 
@@ -48,7 +55,7 @@ target_link_libraries(MyRRALoader optimized
   ${RRA_PATH}/build/win/vs2022/external/rdf/rdf/Release/amdrdf.lib
   ${RRA_PATH}/build/win/vs2022/external/rdf/imported/zstd/Release/zstd.lib
   ${RRA_PATH}/build/win/vs2022/external/system_info_utils/source/Release/system_info.lib
-  ${CMAKE_SOURCE_DIR}/third_party/imgui/examples/libs/glfw/lib-vc2010-64/glfw3.lib
+  glfw
   dxcompiler.lib
 )
 
@@ -73,18 +80,10 @@ add_custom_command(
 add_custom_command(
     TARGET MyRRALoader POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_SOURCE_DIR}/glfw3.dll"
-            "$<TARGET_FILE_DIR:MyRRALoader>"
-    COMMAND_EXPAND_LISTS
-    COMMENT "Copying glfw3.dll to the binary directory"
-)
-add_custom_command(
-    TARGET MyRRALoader POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/3DMarkSolarBay-20241020-003039.rra"
             "$<TARGET_FILE_DIR:MyRRALoader>"
     COMMAND_EXPAND_LISTS
-    COMMENT "Copying glfw3.dll to the binary directory"
+    COMMENT "Copying sample RRA to the binary directory"
 )
 add_custom_command(
     TARGET MyRRALoader POST_BUILD

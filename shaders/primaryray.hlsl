@@ -8,6 +8,7 @@ struct Attributes
 struct HitInfo
 {
     float4 colorAndDistance;
+    int idx;
 };
 
 [shader("raygeneration")]
@@ -30,16 +31,35 @@ void RayGen()
     if (load_ray_from_buffer > 0)
     {
         const uint2 dixy = DispatchRaysIndex().xy;
-        const uint2 ddxy = DispatchRaysDimensions().xy;
-        const uint tidx = dixy.x + dixy.y * ddxy.x;
-        const uint l = buffer_w * buffer_h * buffer_d;
-        if (tidx < l)
+        if (dixy.x < buffer_w && dixy.y < buffer_h * buffer_d)
         {
-            RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[tidx];
-            ray.Origin = rpbm.origin;
-            ray.Direction = rpbm.direction;
-            ray.TMin = rpbm.tmin;
-            ray.TMax = 100000.0;
+            const uint tidx = dixy.x + dixy.y * buffer_w;
+            const uint rayidx_lb = tidx == 0 ? 0 : RayEntryOffsets[tidx - 1];
+            const uint rayidx_ub = RayEntryOffsets[tidx];
+            const uint nr = rayidx_ub - rayidx_lb;
+            if (nr > 0)
+            {
+                float4 sum = float4(0, 0, 0, 0);
+                for (uint rayidx = rayidx_lb; rayidx < rayidx_ub; rayidx++)
+                {
+                    RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[rayidx];
+                    ray.Origin = rpbm.origin;
+                    ray.Direction = rpbm.direction;
+                    ray.TMin = rpbm.tmin;
+                    ray.TMax = rpbm.tmax;
+
+                    HitInfo payload = { float4(0, 0, 0, 1), 0 };
+                    TraceRay(Scene,
+                        RAY_FLAG_NONE,
+                        0xFF, 0, 0, 0, ray, payload);
+                    sum += payload.colorAndDistance;
+                }
+                ret = sum / float(nr);
+            }
+            else
+            {
+                should_skip = true;
+            }
         }
         else
         {
@@ -58,9 +78,9 @@ void RayGen()
         ray.TMax = 10000.0;
     }
     
-    if (should_skip == false)
+    if (should_skip == false && load_ray_from_buffer == 0)
     {
-        HitInfo payload = { float4(0, 0, 0, 1) };
+        HitInfo payload = { float4(0, 0, 0, 1), 0 };
         TraceRay(Scene,
             RAY_FLAG_NONE,
             0xFF, 0, 0, 0, ray, payload);
