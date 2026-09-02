@@ -13,7 +13,21 @@ StructuredBuffer<float3> Vertices : register(t1);
 StructuredBuffer<int> InstanceVertOffsets : register(t2);
 StructuredBuffer<RayInPixBufferMinimal> RaysInPixBufferMinimal : register(t3);
 StructuredBuffer<uint> RayEntryOffsets : register(t4);
+
+struct CompactBatchPixelRange
+{
+    uint pixel;
+    uint begin;
+    uint end;
+    uint pad;
+};
+
+StructuredBuffer<CompactBatchPixelRange> CompactBatchPixelRanges : register(t5);
+StructuredBuffer<uint> CompactPixelRayIndices : register(t6);
 RWTexture2D<float4> RenderTarget : register(u0);
+RWStructuredBuffer<float4> CompactRayResults : register(u4);
+RWStructuredBuffer<float4> CompactAccumColor : register(u5);
+RWStructuredBuffer<uint> CompactAccumCount : register(u6);
 
 cbuffer RayGenCB : register(b0)
 {
@@ -27,6 +41,16 @@ cbuffer RayGenCB : register(b0)
     uint buffer_w;
     uint buffer_h;
     uint buffer_d;  // depth
+    uint rt_w;
+    uint rt_h;
+};
+
+cbuffer CompactReplayCB : register(b1)
+{
+    uint compact_batch_base;
+    uint compact_mode;
+    uint compact_pixel_offset_base;
+    uint compact_pixel_index_base;
 };
 
 float3 TransformPosition(float4x4 m, float3 x)

@@ -59,6 +59,9 @@ struct SceneRay
     float     tmax{10000.0f};
     uint32_t  ray_flags{0};
     uint32_t  instance_inclusion_mask{0xFF};
+    uint32_t  sbt_record_offset{0};
+    uint32_t  sbt_record_stride{0};
+    uint32_t  miss_index{0};
 };
 
 struct SceneDispatchRays

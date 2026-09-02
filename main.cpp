@@ -72,6 +72,30 @@ bool                                 g_dispatch_reflow_skip_empty{true};
 bool                                 g_dispatch_ray_mapping_dirty{true};
 bool                                 g_dispatch_ray_gpu_dirty{true};
 bool                                 g_use_ray_in_pix{false};
+bool                                 g_use_gpu_compact_dispatch_rays{false};
+
+struct CompactDispatchReplayData
+{
+    struct BatchPixelRange
+    {
+        uint32_t pixel{0};
+        uint32_t begin{0};
+        uint32_t end{0};
+        uint32_t pad{0};
+    };
+
+    std::vector<RayInPixDumpFileMinimal> rays;
+    std::vector<uint32_t>                pixel_indices;
+    std::vector<uint32_t>                batch_offsets;
+    std::vector<BatchPixelRange>         batch_pixel_ranges;
+    std::vector<uint32_t>                batch_pixel_range_offsets;
+    std::vector<uint32_t>                pixel_compact_indices;
+    uint32_t                             active_pixels{0};
+    uint32_t                             max_rays_per_pixel{0};
+};
+
+CompactDispatchReplayData g_compact_dispatch_replay;
+bool                      g_compact_dispatch_replay_dirty{true};
 
 struct FrameTime
 {
@@ -109,6 +133,7 @@ struct FrameTime
 };
 
 FrameTime g_frame_time;
+FrameTime g_compact_dispatch_rays_time;
 
 struct Vertex
 {
@@ -131,12 +156,24 @@ struct RayGenCB
     uint32_t          buffer_w;
     uint32_t          buffer_h;
     uint32_t          buffer_d;
+    uint32_t          rt_w;
+    uint32_t          rt_h;
+};
+
+struct CompactReplayRootConstants
+{
+    uint32_t batch_base{0};
+    uint32_t compact_mode{0};
+    uint32_t pixel_offset_base{0};
+    uint32_t pixel_index_base{0};
 };
 
 int WIN_W = 1280, WIN_H = 720;
 constexpr const int FRAME_COUNT = 2;
 
 int RT_W = 1280, RT_H = 720;  // Off-screen RT rendering width and height
+int g_rt_width_input = RT_W;
+int g_rt_height_input = RT_H;
 
 GLFWwindow*      g_window;
 bool             g_use_debug_layer{false};
@@ -157,6 +194,8 @@ ID3D12StateObjectProperties* g_rt_state_object_props;
 ID3D12RootSignature*         g_global_rootsig_ao{};
 ID3D12StateObject*           g_rt_state_object_ao;
 ID3D12StateObjectProperties* g_rt_state_object_props_ao;
+ID3D12RootSignature*         g_compact_reduce_rootsig{};
+ID3D12PipelineState*         g_compact_reduce_pso{};
 
 ID3D12RootSignature* g_rootsig_fsquad{};
 ID3D12PipelineState* g_pipeline_fsquad{};
@@ -206,9 +245,15 @@ ID3D12Resource* g_rays_in_pix_buffer;
 ID3D12Resource* g_rays_in_pix_buffer_upload;
 ID3D12Resource* g_ray_entry_offsets_buffer;
 ID3D12Resource* g_ray_entry_offsets_buffer_upload;
+ID3D12Resource* g_compact_ray_pixel_indices_buffer;
+ID3D12Resource* g_compact_batch_pixel_offsets_buffer;
+ID3D12Resource* g_compact_pixel_compact_indices_buffer;
+ID3D12Resource* g_compact_ray_results_buffer;
+ID3D12Resource* g_compact_accum_color_buffer;
+ID3D12Resource* g_compact_accum_count_buffer;
+std::string    g_adapter_name{"Unknown adapter"};
 
 bool g_use_ao{false};
-int g_use_ray_binning{0};
 bool g_ray_mapping_dirty{true};
 
 ID3D12Fence* g_fence;
@@ -288,6 +333,10 @@ std::optional<CpuRenderResult>  g_latest_cpu_result;
 
 void RebuildDisplayDispatchRays();
 void RebuildGpuDispatchRays();
+void BuildCompactDispatchReplay();
+void ApplySceneCamera(const SceneData& scene);
+void ApplyRenderTargetSize(int width, int height);
+void WaitForPreviousFrame();
 
 glm::vec3 g_scene_aabb_min{1e20, 1e20, 1e20}, g_scene_aabb_max{-1e20, -1e20, -1e20};
 float     g_ao_radius{10000};
@@ -405,6 +454,35 @@ void CE(HRESULT x)
     }
 }
 
+void MarkDispatchRayMappingDirty()
+{
+    g_dispatch_ray_mapping_dirty = true;
+    g_dispatch_ray_gpu_dirty = true;
+    g_compact_dispatch_replay_dirty = true;
+}
+
+void ApplyStablePowerState(bool enabled)
+{
+    if (g_device12 == nullptr)
+    {
+        g_set_steady_power_state = enabled;
+        return;
+    }
+
+    const HRESULT hr = g_device12->SetStablePowerState(enabled);
+    if (FAILED(hr))
+    {
+        g_set_steady_power_state = !enabled;
+        char message[128]{};
+        snprintf(message, sizeof(message), "SetStablePowerState(%d) failed: 0x%08X", enabled ? 1 : 0, static_cast<unsigned int>(hr));
+        g_app_state.SetStatus(message);
+        return;
+    }
+
+    g_set_steady_power_state = enabled;
+    g_app_state.SetStatus(enabled ? "Stable power state enabled" : "Stable power state disabled");
+}
+
 void ReleaseResource(ID3D12Resource** resource)
 {
     if (resource != nullptr && *resource != nullptr)
@@ -471,6 +549,46 @@ void CreateStructuredBufferSrv(ID3D12Resource** resource,
     g_device12->CreateShaderResourceView(*resource, &srv_desc, handle);
 }
 
+void CreateStructuredBufferUav(ID3D12Resource** resource, size_t element_size, uint32_t element_count, uint32_t descriptor_index)
+{
+    ReleaseResource(resource);
+
+    const uint32_t safe_element_count = std::max(1u, element_count);
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    props.CreationNodeMask     = 1;
+    props.VisibleNodeMask      = 1;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment          = 0;
+    desc.Width              = static_cast<UINT64>(safe_element_count) * element_size;
+    desc.Height             = 1;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    CE(g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(resource)));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.CounterOffsetInBytes = 0;
+    uav_desc.Buffer.FirstElement         = 0;
+    uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_NONE;
+    uav_desc.Buffer.NumElements          = safe_element_count;
+    uav_desc.Buffer.StructureByteStride  = static_cast<UINT>(element_size);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+    handle.ptr += descriptor_index * g_srv_uav_cbv_descriptor_size;
+    g_device12->CreateUnorderedAccessView(*resource, nullptr, &uav_desc, handle);
+}
+
 void UpdateDispatchRayGpuBuffers()
 {
     if (g_srv_uav_cbv_heap == nullptr || g_device12 == nullptr)
@@ -497,6 +615,230 @@ void UpdateDispatchRayGpuBuffers()
                               static_cast<uint32_t>(g_gpu_dispatch_ray_offsets.size()),
                               9);
     g_dispatch_ray_gpu_dirty = false;
+}
+
+void UpdateCompactDispatchReplayGpuBuffers()
+{
+    if (g_srv_uav_cbv_heap == nullptr || g_device12 == nullptr)
+    {
+        return;
+    }
+    if (g_compact_dispatch_replay_dirty)
+    {
+        BuildCompactDispatchReplay();
+    }
+
+    CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
+                              g_compact_dispatch_replay.rays.empty() ? nullptr : g_compact_dispatch_replay.rays.data(),
+                              sizeof(RayInPixDumpFileMinimal),
+                              static_cast<uint32_t>(g_compact_dispatch_replay.rays.size()),
+                              8);
+    CreateStructuredBufferSrv(&g_compact_batch_pixel_offsets_buffer,
+                              g_compact_dispatch_replay.batch_pixel_ranges.empty() ? nullptr : g_compact_dispatch_replay.batch_pixel_ranges.data(),
+                              sizeof(CompactDispatchReplayData::BatchPixelRange),
+                              static_cast<uint32_t>(g_compact_dispatch_replay.batch_pixel_ranges.size()),
+                              13);
+    CreateStructuredBufferSrv(&g_compact_pixel_compact_indices_buffer,
+                              g_compact_dispatch_replay.pixel_compact_indices.empty() ? nullptr : g_compact_dispatch_replay.pixel_compact_indices.data(),
+                              sizeof(uint32_t),
+                              static_cast<uint32_t>(g_compact_dispatch_replay.pixel_compact_indices.size()),
+                              14);
+    CreateStructuredBufferUav(&g_compact_ray_results_buffer,
+                              sizeof(float) * 4,
+                              static_cast<uint32_t>(g_compact_dispatch_replay.rays.size()),
+                              10);
+    CreateStructuredBufferUav(&g_compact_accum_color_buffer,
+                              sizeof(float) * 4,
+                              static_cast<uint32_t>(RT_W * RT_H),
+                              11);
+    CreateStructuredBufferUav(&g_compact_accum_count_buffer,
+                              sizeof(uint32_t),
+                              static_cast<uint32_t>(RT_W * RT_H),
+                              12);
+    g_dispatch_ray_gpu_dirty = false;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GpuDescriptor(uint32_t descriptor_index)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetGPUDescriptorHandleForHeapStart());
+    handle.ptr += descriptor_index * g_srv_uav_cbv_descriptor_size;
+    return handle;
+}
+
+void RecreateRenderTargetSizedResources()
+{
+    if (g_device12 == nullptr || g_srv_uav_cbv_heap == nullptr)
+    {
+        return;
+    }
+
+    WaitForPreviousFrame();
+
+    ReleaseResource(&g_rt_output_resource);
+    ReleaseResource(&g_cpu_rt_upload);
+    ReleaseResource(&g_hitpos_ao);
+    ReleaseResource(&g_hitpos_ao_readback);
+    ReleaseResource(&g_ray_mapping_upload);
+    ReleaseResource(&g_ray_mapping);
+    ReleaseResource(&g_aoray_dirs_upload);
+    ReleaseResource(&g_aoray_dirs);
+
+    const uint32_t rt_w = static_cast<uint32_t>(std::max(1, RT_W));
+    const uint32_t rt_h = static_cast<uint32_t>(std::max(1, RT_H));
+    const uint64_t rt_pixels = static_cast<uint64_t>(rt_w) * rt_h;
+
+    D3D12_HEAP_PROPERTIES default_props{};
+    default_props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    default_props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    default_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    default_props.CreationNodeMask     = 1;
+    default_props.VisibleNodeMask      = 1;
+
+    D3D12_HEAP_PROPERTIES upload_props = default_props;
+    upload_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_HEAP_PROPERTIES readback_props = default_props;
+    readback_props.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC rt_desc{};
+    rt_desc.DepthOrArraySize = 1;
+    rt_desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    rt_desc.Width            = rt_w;
+    rt_desc.Height           = rt_h;
+    rt_desc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rt_desc.MipLevels        = 1;
+    rt_desc.SampleDesc.Count = 1;
+    CE(g_device12->CreateCommittedResource(
+        &default_props, D3D12_HEAP_FLAG_NONE, &rt_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_rt_output_resource)));
+    g_rt_output_resource->SetName(L"RT output resource");
+
+    g_device12->GetCopyableFootprints(&rt_desc, 0, 1, 0, &g_cpu_rt_upload_footprint, &g_cpu_rt_upload_num_rows, &g_cpu_rt_upload_row_size, &g_cpu_rt_upload_total_size);
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Alignment          = 0;
+    buffer_desc.Width              = g_cpu_rt_upload_total_size;
+    buffer_desc.Height             = 1;
+    buffer_desc.DepthOrArraySize   = 1;
+    buffer_desc.MipLevels          = 1;
+    buffer_desc.Format             = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count   = 1;
+    buffer_desc.SampleDesc.Quality = 0;
+    buffer_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(
+        &upload_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cpu_rt_upload)));
+    g_cpu_rt_upload->SetName(L"CPU RT upload");
+
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    buffer_desc.Width = rt_pixels * sizeof(float) * 4;
+    CE(g_device12->CreateCommittedResource(&default_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_hitpos_ao)));
+    g_hitpos_ao->SetName(L"Hit position");
+
+    D3D12_RESOURCE_DESC readback_desc = buffer_desc;
+    readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(&readback_props, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_hitpos_ao_readback)));
+    g_hitpos_ao_readback->SetName(L"Hit position readback");
+
+    buffer_desc.Width = rt_pixels * sizeof(int);
+    readback_desc = buffer_desc;
+    readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(&upload_props, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_ray_mapping_upload)));
+    CE(g_device12->CreateCommittedResource(&default_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_ray_mapping)));
+    g_ray_mapping_upload->SetName(L"Ray mapping upload");
+    g_ray_mapping->SetName(L"Ray mapping");
+
+    buffer_desc.Width = rt_pixels * sizeof(float) * 3;
+    readback_desc = buffer_desc;
+    readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    CE(g_device12->CreateCommittedResource(&upload_props, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_aoray_dirs_upload)));
+    CE(g_device12->CreateCommittedResource(&default_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&g_aoray_dirs)));
+    g_aoray_dirs->SetName(L"AO ray dirs");
+    g_aoray_dirs_upload->SetName(L"AO ray dirs upload");
+
+    D3D12_CPU_DESCRIPTOR_HANDLE handle(g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_device12->CreateUnorderedAccessView(g_rt_output_resource, nullptr, &uav_desc, handle);
+
+    handle.ptr = g_srv_uav_cbv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 5 * g_srv_uav_cbv_descriptor_size;
+    uav_desc.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.CounterOffsetInBytes = 0;
+    uav_desc.Buffer.FirstElement         = 0;
+    uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_NONE;
+    uav_desc.Buffer.NumElements          = static_cast<UINT>(rt_pixels);
+    uav_desc.Buffer.StructureByteStride  = sizeof(float) * 4;
+    g_device12->CreateUnorderedAccessView(g_hitpos_ao, nullptr, &uav_desc, handle);
+
+    handle.ptr += g_srv_uav_cbv_descriptor_size;
+    uav_desc.Buffer.StructureByteStride = sizeof(int);
+    g_device12->CreateUnorderedAccessView(g_ray_mapping, nullptr, &uav_desc, handle);
+
+    handle.ptr += g_srv_uav_cbv_descriptor_size;
+    uav_desc.Buffer.StructureByteStride = sizeof(float) * 3;
+    g_device12->CreateUnorderedAccessView(g_aoray_dirs, nullptr, &uav_desc, handle);
+
+    if (g_srv_uav_cbv_heap_fsquad != nullptr)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Format                    = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_desc.Texture2D.MipLevels       = 1;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE srv_handle(g_srv_uav_cbv_heap_fsquad->GetCPUDescriptorHandleForHeapStart());
+        g_device12->CreateShaderResourceView(g_rt_output_resource, &srv_desc, srv_handle);
+    }
+
+    CreateStructuredBufferUav(&g_compact_ray_results_buffer, sizeof(float) * 4, 1, 10);
+    CreateStructuredBufferUav(&g_compact_accum_color_buffer, sizeof(float) * 4, 1, 11);
+    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 1, 12);
+
+    MarkDispatchRayMappingDirty();
+    g_ray_mapping_dirty = true;
+    g_hitpos_dirty = true;
+    g_cpu_refresh_requested = true;
+    g_cpu_display_tiles_completed = 0;
+    g_cpu_display_tiles_total = 0;
+    g_cpu_display_generation = 0;
+    g_app_state.SetCpuRenderStats({});
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        g_latest_cpu_result.reset();
+    }
+
+    if (g_app_state.as_built.load())
+    {
+        ApplySceneCamera(g_scene_data);
+    }
+}
+
+void ApplyRenderTargetSize(int width, int height)
+{
+    width = std::clamp(width, 1, 16384);
+    height = std::clamp(height, 1, 16384);
+    if (RT_W == width && RT_H == height)
+    {
+        g_rt_width_input = RT_W;
+        g_rt_height_input = RT_H;
+        return;
+    }
+
+    RT_W = width;
+    RT_H = height;
+    g_rt_width_input = RT_W;
+    g_rt_height_input = RT_H;
+    if (g_device12 != nullptr && g_srv_uav_cbv_heap != nullptr)
+    {
+        RecreateRenderTargetSizedResources();
+    }
+    else
+    {
+        MarkDispatchRayMappingDirty();
+    }
+    printf("Render target resized to %dx%d\n", RT_W, RT_H);
 }
 
 void WaitForPreviousFrame()
@@ -910,6 +1252,123 @@ void RebuildGpuDispatchRays()
     g_dispatch_ray_gpu_dirty = true;
 }
 
+void BuildCompactDispatchReplay()
+{
+    if (g_dispatch_ray_mapping_dirty)
+    {
+        RebuildDisplayDispatchRays();
+    }
+
+    g_compact_dispatch_replay = {};
+    if (g_display_ray_buffer.empty() || g_display_ray_offsets.empty())
+    {
+        g_compact_dispatch_replay.batch_offsets.push_back(0);
+        g_compact_dispatch_replay_dirty = false;
+        return;
+    }
+
+    struct Entry
+    {
+        uint32_t src_ray_index{0};
+        uint32_t pixel_index{0};
+        uint32_t ray_index{0};
+        uint32_t sbt_record_offset{0};
+        uint32_t sbt_record_stride{0};
+        uint32_t miss_index{0};
+    };
+
+    std::vector<Entry> entries;
+    entries.reserve(g_display_ray_buffer.size());
+    uint32_t previous_offset = 0;
+    for (uint32_t pixel = 0; pixel < g_display_ray_offsets.size(); pixel++)
+    {
+        const uint32_t end = std::min<uint32_t>(g_display_ray_offsets[pixel], static_cast<uint32_t>(g_display_ray_buffer.size()));
+        for (uint32_t ray = previous_offset; ray < end; ray++)
+        {
+            const auto& scene_ray = g_display_ray_buffer[ray];
+            entries.push_back({ray,
+                               pixel,
+                               ray - previous_offset,
+                               scene_ray.sbt_record_offset,
+                               scene_ray.sbt_record_stride,
+                               scene_ray.miss_index});
+        }
+        previous_offset = end;
+    }
+
+    std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        return std::tie(a.ray_index, a.sbt_record_offset, a.sbt_record_stride, a.miss_index, a.pixel_index) <
+               std::tie(b.ray_index, b.sbt_record_offset, b.sbt_record_stride, b.miss_index, b.pixel_index);
+    });
+
+    g_compact_dispatch_replay.rays.reserve(entries.size());
+    g_compact_dispatch_replay.pixel_indices.reserve(entries.size());
+    g_compact_dispatch_replay.batch_offsets.push_back(0);
+
+    uint32_t current_ray_index = entries.empty() ? 0 : entries.front().ray_index;
+    for (const Entry& entry : entries)
+    {
+        if (entry.ray_index != current_ray_index)
+        {
+            current_ray_index = entry.ray_index;
+            g_compact_dispatch_replay.batch_offsets.push_back(static_cast<uint32_t>(g_compact_dispatch_replay.rays.size()));
+        }
+        g_compact_dispatch_replay.rays.push_back(g_display_ray_buffer[entry.src_ray_index]);
+        g_compact_dispatch_replay.pixel_indices.push_back(entry.pixel_index);
+    }
+    g_compact_dispatch_replay.batch_offsets.push_back(static_cast<uint32_t>(g_compact_dispatch_replay.rays.size()));
+
+    const uint32_t dst_nr = static_cast<uint32_t>(g_display_ray_offsets.size());
+    std::vector<uint32_t> counts(dst_nr, 0);
+    std::vector<uint32_t> cursors(dst_nr, 0);
+    std::vector<uint32_t> touched_pixels;
+    g_compact_dispatch_replay.batch_pixel_range_offsets.reserve(g_compact_dispatch_replay.batch_offsets.size());
+    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+    {
+        const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
+        const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
+        touched_pixels.clear();
+        for (uint32_t compact_id = batch_begin; compact_id < batch_end; compact_id++)
+        {
+            const uint32_t pixel = g_compact_dispatch_replay.pixel_indices[compact_id];
+            if (counts[pixel] == 0)
+            {
+                touched_pixels.push_back(pixel);
+            }
+            counts[pixel]++;
+        }
+        std::sort(touched_pixels.begin(), touched_pixels.end());
+
+        g_compact_dispatch_replay.batch_pixel_range_offsets.push_back(static_cast<uint32_t>(g_compact_dispatch_replay.batch_pixel_ranges.size()));
+        for (uint32_t pixel : touched_pixels)
+        {
+            const uint32_t begin = static_cast<uint32_t>(g_compact_dispatch_replay.pixel_compact_indices.size());
+            const uint32_t end = begin + counts[pixel];
+            g_compact_dispatch_replay.batch_pixel_ranges.push_back({pixel, begin, end, 0});
+            cursors[pixel] = begin;
+            g_compact_dispatch_replay.pixel_compact_indices.resize(end);
+        }
+
+        for (uint32_t compact_id = batch_begin; compact_id < batch_end; compact_id++)
+        {
+            const uint32_t pixel = g_compact_dispatch_replay.pixel_indices[compact_id];
+            g_compact_dispatch_replay.pixel_compact_indices[cursors[pixel]++] = compact_id;
+        }
+
+        for (uint32_t pixel : touched_pixels)
+        {
+            counts[pixel] = 0;
+            cursors[pixel] = 0;
+        }
+    }
+    g_compact_dispatch_replay.batch_pixel_range_offsets.push_back(static_cast<uint32_t>(g_compact_dispatch_replay.batch_pixel_ranges.size()));
+
+    ComputeRayOffsetStats(g_display_ray_offsets,
+                          &g_compact_dispatch_replay.active_pixels,
+                          &g_compact_dispatch_replay.max_rays_per_pixel);
+    g_compact_dispatch_replay_dirty = false;
+}
+
 std::vector<CpuRay> BuildCpuExternalRays()
 {
     std::vector<CpuRay> rays;
@@ -1280,8 +1739,27 @@ void DrawImGuiPanel()
     if (ImGui::Begin("Runtime"))
     {
         ImGui::Text("Stage: %s", ToString(g_app_state.scene_stage.load()));
+        ImGui::Text("Adapter: %s", g_adapter_name.c_str());
         ImGui::Text("GPU frame: %.3f ms", g_app_state.last_gpu_frame_ms);
+        bool stable_power_state = g_set_steady_power_state;
+        if (ImGui::Checkbox("Stable power state", &stable_power_state))
+        {
+            ApplyStablePowerState(stable_power_state);
+        }
+        if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+        {
+            ImGui::Text("GPU compact DispatchRays: %.3f ms", g_app_state.last_gpu_compact_dispatch_rays_ms);
+        }
         ImGui::Text("Render: %dx%d -> %dx%d", RT_W, RT_H, WIN_W, WIN_H);
+        ImGui::PushItemWidth(90);
+        ImGui::InputInt("RT width", &g_rt_width_input, 1, 64);
+        ImGui::SameLine();
+        ImGui::InputInt("RT height", &g_rt_height_input, 1, 64);
+        ImGui::PopItemWidth();
+        if (ImGui::Button("Apply RT"))
+        {
+            ApplyRenderTargetSize(g_rt_width_input, g_rt_height_input);
+        }
         ImGui::Text("Backend: %s", ToString(g_render_backend));
         ImGui::Text("CPU worker: %s", ToString(g_cpu_worker_stage.load()));
         ImGui::Text("CPU tiles done: %u / %u", g_cpu_display_tiles_completed, g_cpu_display_tiles_total);
@@ -1386,11 +1864,15 @@ void DrawImGuiPanel()
         ImGui::Separator();
         if (ImGui::Checkbox("Use dispatch rays", &g_use_ray_in_pix))
         {
-            g_dispatch_ray_mapping_dirty = true;
+            MarkDispatchRayMappingDirty();
         }
         const bool has_rra_dispatches = !g_scene_data.dispatches.empty();
         if (g_use_ray_in_pix)
         {
+            if (ImGui::Checkbox("GPU compact replay", &g_use_gpu_compact_dispatch_rays))
+            {
+                MarkDispatchRayMappingDirty();
+            }
             if (has_rra_dispatches)
             {
                 std::vector<const char*> dispatch_names;
@@ -1401,7 +1883,19 @@ void DrawImGuiPanel()
                 }
                 if (ImGui::Combo("RRA dispatch", &g_selected_dispatch_index, dispatch_names.data(), static_cast<int>(dispatch_names.size())))
                 {
-                    g_dispatch_ray_mapping_dirty = true;
+                    const SceneDispatchRays* dispatch = CurrentRraDispatch();
+                    if (dispatch != nullptr)
+                    {
+                        ApplyRenderTargetSize(static_cast<int>(dispatch->dispatch_dims.x),
+                                              static_cast<int>(dispatch->dispatch_dims.y * std::max(1u, dispatch->dispatch_dims.z)));
+                    }
+                    MarkDispatchRayMappingDirty();
+                }
+                const SceneDispatchRays* dispatch = CurrentRraDispatch();
+                if (dispatch != nullptr && ImGui::Button("RT = dispatch"))
+                {
+                    ApplyRenderTargetSize(static_cast<int>(dispatch->dispatch_dims.x),
+                                          static_cast<int>(dispatch->dispatch_dims.y * std::max(1u, dispatch->dispatch_dims.z)));
                 }
             }
             else
@@ -1412,7 +1906,7 @@ void DrawImGuiPanel()
             static const char* kDispatchLayoutLabels[] = {"Clamp to viewport", "Reflow blocks"};
             if (ImGui::Combo("Ray layout", &g_dispatch_ray_layout_mode, kDispatchLayoutLabels, IM_ARRAYSIZE(kDispatchLayoutLabels)))
             {
-                g_dispatch_ray_mapping_dirty = true;
+                MarkDispatchRayMappingDirty();
             }
             static int reflow_block_w{8}, reflow_block_h{8};
             static bool reflow_skip_empty{false};
@@ -1441,10 +1935,10 @@ void DrawImGuiPanel()
                 ImGui::SameLine();
                 if (ImGui::Button("Apply"))
                 {
-                    g_dispatch_ray_mapping_dirty = true;
                     g_dispatch_reflow_block_w    = reflow_block_w;
                     g_dispatch_reflow_block_h    = reflow_block_h;
                     g_dispatch_reflow_skip_empty = reflow_skip_empty;
+                    MarkDispatchRayMappingDirty();
                 }
             }
             if (g_dispatch_ray_mapping_dirty)
@@ -1458,13 +1952,19 @@ void DrawImGuiPanel()
             ImGui::Text("GPU uploaded rays: %zu", g_gpu_dispatch_ray_buffer.size());
             ImGui::Text("GPU active pixels: %u", g_gpu_dispatch_ray_active_pixels);
             ImGui::Text("GPU max rays/pixel: %u", g_gpu_dispatch_ray_max_rays_per_pixel);
+            if (g_use_gpu_compact_dispatch_rays)
+            {
+                ImGui::Text("Compact batches: %zu", g_compact_dispatch_replay.batch_offsets.empty() ? 0 : g_compact_dispatch_replay.batch_offsets.size() - 1);
+                ImGui::Text("Compact rays: %zu", g_compact_dispatch_replay.rays.size());
+                ImGui::Text("Compact pixel ranges: %zu", g_compact_dispatch_replay.batch_pixel_ranges.size());
+                ImGui::Text("Compact pixel ray indices: %zu", g_compact_dispatch_replay.pixel_compact_indices.size());
+            }
         }
         if (g_use_ao)
         {
             ImGui::Text("AO samples: %d", g_ao_sample_count);
             ImGui::Text("AO radius: %.1f", g_ao_radius);
         }
-        ImGui::Text("Ray binning: %d", g_use_ray_binning);
         ImGui::Text("PIX rays: %s", g_use_ray_in_pix ? "on" : "off");
         ImGui::Separator();
 
@@ -1655,22 +2155,11 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             g_render_backend = RenderBackend::kDxr;
             g_use_ao = true;
-            g_use_ray_binning = false;
             break;
         }
         case GLFW_KEY_0: {
             g_render_backend = RenderBackend::kDxr;
             g_use_ao = false;
-            break;
-        }
-        case GLFW_KEY_3:
-        case GLFW_KEY_2:
-        {
-            g_render_backend = RenderBackend::kDxr;
-            g_ao_sample_count = 1;
-            g_use_ao          = true;
-            g_use_ray_binning = key - GLFW_KEY_0;
-            g_ray_mapping_dirty = true;
             break;
         }
         case GLFW_KEY_4:
@@ -1856,6 +2345,9 @@ void InitDeviceAndCommandQ()
         else
         {
             CE(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&g_device12)));
+            char adapter_name[256]{};
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, adapter_name, static_cast<int>(sizeof(adapter_name)), nullptr, nullptr);
+            g_adapter_name = adapter_name;
             printf("Created device = %ls\n", desc.Description);
             break;
         }
@@ -2014,18 +2506,16 @@ void InitDX12Stuff()
 
     // CBV SRV UAV Heap
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.NumDescriptors = 10;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix, [9]=RayEntryOffsets
+    heap_desc.NumDescriptors = 15;  // [0]=output, [1]=BVH, [2]=CBV, [3]=Verts, [4]=Offsets, [5]=HitNormal, [6]=Mapping, [7]=Dirs, [8]=RaysInPix, [9]=RayEntryOffsets, [10]=CompactResults, [11]=CompactAccumColor, [12]=CompactAccumCount, [13]=CompactBatchPixelOffsets, [14]=CompactPixelRayIndices
     heap_desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CE(g_device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_srv_uav_cbv_heap)));
     g_srv_uav_cbv_heap->SetName(L"SRV UAV CBV heap");
     g_srv_uav_cbv_descriptor_size = g_device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    UpdateDispatchRayGpuBuffers();
-
     // Query heap
     D3D12_QUERY_HEAP_DESC qhd{};
-    qhd.Count    = 2;
+    qhd.Count    = 4;
     qhd.Type     = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qhd.NodeMask = 0;
     CE(g_device12->CreateQueryHeap(&qhd, IID_PPV_ARGS(&g_query_heap)));
@@ -2034,7 +2524,7 @@ void InitDX12Stuff()
     props.Type     = D3D12_HEAP_TYPE_READBACK;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Format    = DXGI_FORMAT_UNKNOWN;
-    desc.Width     = sizeof(uint64_t) * 2;
+    desc.Width     = sizeof(uint64_t) * 4;
     desc.Flags     = D3D12_RESOURCE_FLAG_NONE;
     CE(g_device12->CreateCommittedResource(
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_query_readback_buffer)));
@@ -2061,6 +2551,11 @@ void InitDX12Stuff()
     uav_desc.Buffer.StructureByteStride = sizeof(float) * 3;
     handle.ptr += g_srv_uav_cbv_descriptor_size;
     g_device12->CreateUnorderedAccessView(g_aoray_dirs, nullptr, &uav_desc, handle);
+
+    UpdateDispatchRayGpuBuffers();
+    CreateStructuredBufferUav(&g_compact_ray_results_buffer, sizeof(float) * 4, 1, 10);
+    CreateStructuredBufferUav(&g_compact_accum_color_buffer, sizeof(float) * 4, 1, 11);
+    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 1, 12);
 
     // Root params for drawing the FSQUAD
     {
@@ -2236,9 +2731,11 @@ void CreateRTPipeline()
 {
     // 1. Root parameters (global)
     {
-        D3D12_ROOT_PARAMETER root_params[2]{};
+        D3D12_ROOT_PARAMETER root_params[4]{};
         root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        root_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 
         D3D12_DESCRIPTOR_RANGE desc_ranges[5]{};
         desc_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Output0
@@ -2280,11 +2777,24 @@ void CreateRTPipeline()
         root_params[1].DescriptorTable.pDescriptorRanges   = desc_ranges1;
         root_params[1].DescriptorTable.NumDescriptorRanges = 1;
         root_params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+        root_params[2].Constants.Num32BitValues            = sizeof(CompactReplayRootConstants) / sizeof(uint32_t);
+        root_params[2].Constants.ShaderRegister            = 1;
+        root_params[2].Constants.RegisterSpace             = 0;
+        root_params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_DESCRIPTOR_RANGE compact_uav_range{};
+        compact_uav_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        compact_uav_range.NumDescriptors                    = 3;
+        compact_uav_range.BaseShaderRegister                = 4;
+        compact_uav_range.RegisterSpace                     = 0;
+        compact_uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        root_params[3].DescriptorTable.pDescriptorRanges    = &compact_uav_range;
+        root_params[3].DescriptorTable.NumDescriptorRanges  = 1;
+        root_params[3].ShaderVisibility                     = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootsig_desc{};
         rootsig_desc.NumStaticSamplers = 0;
         rootsig_desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        rootsig_desc.NumParameters     = 2;
+        rootsig_desc.NumParameters     = 4;
         rootsig_desc.pParameters       = root_params;
 
         ID3DBlob *signature, *error;
@@ -2298,11 +2808,12 @@ void CreateRTPipeline()
         if (error)
             error->Release();
 
-        desc_ranges[4].RangeType      = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Hit position, mapping, Raydirs
-        desc_ranges[4].NumDescriptors = 3;
-        desc_ranges[4].BaseShaderRegister = 1;
-        desc_ranges[4].RegisterSpace      = 0;
+        desc_ranges[4].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Hit position, mapping, Raydirs
+        desc_ranges[4].NumDescriptors                    = 3;
+        desc_ranges[4].BaseShaderRegister                = 1;
+        desc_ranges[4].RegisterSpace                     = 0;
         desc_ranges[4].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
         root_params[0].DescriptorTable.NumDescriptorRanges = 5;
 
         D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
@@ -2517,6 +3028,95 @@ int RoundUp(int x, int align)
     return align * ((x - 1) / align + 1);
 }
 
+void CreateCompactReducePipeline()
+{
+    D3D12_ROOT_PARAMETER root_params[5]{};
+    root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+
+    D3D12_DESCRIPTOR_RANGE output_uav_range{};
+    output_uav_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_uav_range.NumDescriptors                    = 1;
+    output_uav_range.BaseShaderRegister                = 0;
+    output_uav_range.RegisterSpace                     = 0;
+    output_uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    root_params[0].DescriptorTable.pDescriptorRanges   = &output_uav_range;
+    root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+    root_params[0].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE compact_uav_range{};
+    compact_uav_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    compact_uav_range.NumDescriptors                    = 3;
+    compact_uav_range.BaseShaderRegister                = 4;
+    compact_uav_range.RegisterSpace                     = 0;
+    compact_uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    root_params[1].DescriptorTable.pDescriptorRanges    = &compact_uav_range;
+    root_params[1].DescriptorTable.NumDescriptorRanges  = 1;
+    root_params[1].ShaderVisibility                     = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE compact_srv_range{};
+    compact_srv_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    compact_srv_range.NumDescriptors                    = 2;
+    compact_srv_range.BaseShaderRegister                = 5;
+    compact_srv_range.RegisterSpace                     = 0;
+    compact_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    root_params[2].DescriptorTable.pDescriptorRanges    = &compact_srv_range;
+    root_params[2].DescriptorTable.NumDescriptorRanges  = 1;
+    root_params[2].ShaderVisibility                     = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE cbv_range{};
+    cbv_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+    cbv_range.NumDescriptors                    = 1;
+    cbv_range.BaseShaderRegister                = 0;
+    cbv_range.RegisterSpace                     = 0;
+    cbv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    root_params[3].DescriptorTable.pDescriptorRanges   = &cbv_range;
+    root_params[3].DescriptorTable.NumDescriptorRanges = 1;
+    root_params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_params[4].Constants.Num32BitValues = sizeof(CompactReplayRootConstants) / sizeof(uint32_t);
+    root_params[4].Constants.ShaderRegister = 1;
+    root_params[4].Constants.RegisterSpace  = 0;
+    root_params[4].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootsig_desc{};
+    rootsig_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    rootsig_desc.NumParameters = _countof(root_params);
+    rootsig_desc.pParameters   = root_params;
+
+    ID3DBlob *signature{}, *error{};
+    D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+    if (error)
+    {
+        printf("Error: %s\n", static_cast<char*>(error->GetBufferPointer()));
+    }
+    CE(g_device12->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_compact_reduce_rootsig)));
+    signature->Release();
+    if (error)
+    {
+        error->Release();
+    }
+
+    ID3DBlob *cs_blob{}, *cs_error{};
+    D3DCompileFromFile(L"shaders/compact_reduce.hlsl", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &cs_blob, &cs_error);
+    if (cs_error)
+    {
+        printf("Error building compact reduce CS: %s\n", static_cast<char*>(cs_error->GetBufferPointer()));
+        cs_error->Release();
+    }
+    CE(cs_blob == nullptr ? E_FAIL : S_OK);
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = g_compact_reduce_rootsig;
+    pso_desc.CS.pShaderBytecode = cs_blob->GetBufferPointer();
+    pso_desc.CS.BytecodeLength = cs_blob->GetBufferSize();
+    CE(g_device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&g_compact_reduce_pso)));
+    cs_blob->Release();
+}
+
 void CreateShaderBindingTable()
 {
     // Primay ray's SBT
@@ -2607,7 +3207,11 @@ void Render()
     }
 
     DrawImGuiPanel();
-    if (g_use_ray_in_pix && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty))
+    if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty || g_compact_dispatch_replay_dirty))
+    {
+        UpdateCompactDispatchReplayGpuBuffers();
+    }
+    else if (g_use_ray_in_pix && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty))
     {
         UpdateDispatchRayGpuBuffers();
     }
@@ -2620,12 +3224,14 @@ void Render()
     GlmMat4ToDirectXMatrix(&cb.inverse_proj, g_inv_proj);
     cb.invert_y   = g_invert_y;
     cb.ao_samples = g_ao_sample_count;
-    cb.use_ray_binning = g_use_ray_binning;
+    cb.use_ray_binning = false;
     cb.ao_radius       = g_ao_radius;
-    cb.load_ray_from_buffer = g_use_ray_in_pix;
+    cb.load_ray_from_buffer = g_use_ray_in_pix ? (g_use_gpu_compact_dispatch_rays ? 5u : 1u) : 0u;
     cb.buffer_w             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.x : g_ray_in_pix_dispatch_dims.x;
     cb.buffer_h             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.y : g_ray_in_pix_dispatch_dims.y;
     cb.buffer_d             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.z : g_ray_in_pix_dispatch_dims.z;
+    cb.rt_w                 = static_cast<uint32_t>(RT_W);
+    cb.rt_h                 = static_cast<uint32_t>(RT_H);
     memcpy(mapped, &cb, sizeof(RayGenCB));
     g_raygen_cb->Unmap(0, nullptr);
 
@@ -2678,6 +3284,9 @@ void Render()
                 g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
                 g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
                 g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                CompactReplayRootConstants compact_constants{};
+                g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
                 g_command_list->SetPipelineState1(g_rt_state_object);
                 desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
                 desc.RayGenerationShaderRecord.SizeInBytes  = 64;
@@ -2685,10 +3294,106 @@ void Render()
                 desc.MissShaderTable.SizeInBytes            = 64;
                 desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
                 desc.HitGroupTable.SizeInBytes              = 64;
-                desc.Width                                  = RT_W;
-                desc.Height                                 = RT_H;
-                desc.Depth                                  = 1;
-                g_command_list->DispatchRays(&desc);
+                if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+                {
+                    g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
+                    g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
+                    g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
+                    g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
+                    g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
+                    g_command_list->SetPipelineState(g_compact_reduce_pso);
+                    compact_constants.compact_mode = 0;
+                    g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                    g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
+
+                    D3D12_RESOURCE_BARRIER uav_barriers[3]{};
+                    for (auto& uav_barrier : uav_barriers)
+                    {
+                        uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    }
+                    uav_barriers[0].UAV.pResource = g_compact_ray_results_buffer;
+                    uav_barriers[1].UAV.pResource = g_compact_accum_color_buffer;
+                    uav_barriers[2].UAV.pResource = g_compact_accum_count_buffer;
+                    g_command_list->ResourceBarrier(3, uav_barriers);
+
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+                    {
+                        const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
+                        const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
+                        const uint32_t batch_count = batch_end - batch_begin;
+                        if (batch_count == 0)
+                        {
+                            continue;
+                        }
+                        const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
+                        const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
+                        const uint32_t range_count = range_end - range_begin;
+                        if (range_count == 0)
+                        {
+                            continue;
+                        }
+
+                        g_command_list->SetComputeRootSignature(g_global_rootsig);
+                        g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+                        g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                        compact_constants = {};
+                        compact_constants.batch_base = batch_begin;
+                        compact_constants.compact_mode = 1;
+                        g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                        g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
+                        g_command_list->SetPipelineState1(g_rt_state_object);
+                        desc.Width = batch_count;
+                        desc.Height = 1;
+                        desc.Depth = 1;
+                        g_command_list->DispatchRays(&desc);
+                    }
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                    g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+
+                    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+                    {
+                        const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
+                        const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
+                        const uint32_t range_count = range_end - range_begin;
+                        if (range_count == 0)
+                        {
+                            continue;
+                        }
+                        g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
+                        g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
+                        g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
+                        g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
+                        g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
+                        g_command_list->SetPipelineState(g_compact_reduce_pso);
+                        compact_constants = {};
+                        compact_constants.batch_base = range_count;
+                        compact_constants.compact_mode = 1;
+                        compact_constants.pixel_offset_base = range_begin;
+                        compact_constants.pixel_index_base = 0;
+                        g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                        g_command_list->Dispatch((range_count + 63) / 64, 1, 1);
+                        g_command_list->ResourceBarrier(2, &uav_barriers[1]);
+                    }
+
+                    g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
+                    g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
+                    g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
+                    g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
+                    g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
+                    g_command_list->SetPipelineState(g_compact_reduce_pso);
+                    compact_constants = {};
+                    compact_constants.compact_mode = 2;
+                    g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                    g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
+                }
+                else
+                {
+                    desc.Width                                  = RT_W;
+                    desc.Height                                 = RT_H;
+                    desc.Depth                                  = 1;
+                    g_command_list->DispatchRays(&desc);
+                }
             }
             else
             {
@@ -2696,6 +3401,9 @@ void Render()
                 g_command_list->SetDescriptorHeaps(1, &g_srv_uav_cbv_heap);
                 g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
                 g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                CompactReplayRootConstants compact_constants{};
+                g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
                 g_command_list->SetPipelineState1(g_rt_state_object_ao);
 
                 g_command_list->ResourceBarrier(1, &hitpos_barrier);
@@ -2738,7 +3446,13 @@ void Render()
             }
 
             g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-            g_command_list->ResolveQueryData(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g_query_readback_buffer, 0);
+            const bool measure_compact_dispatch_rays = !g_use_ao && g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays;
+            g_command_list->ResolveQueryData(g_query_heap,
+                                             D3D12_QUERY_TYPE_TIMESTAMP,
+                                             0,
+                                             measure_compact_dispatch_rays ? 4 : 2,
+                                             g_query_readback_buffer,
+                                             0);
 
             if (g_use_ao)
             {
@@ -2817,200 +3531,6 @@ void Render()
     WaitForPreviousFrame();
     CE(g_command_allocator->Reset());
 
-    // Read back ray dirs
-    if (g_render_backend == RenderBackend::kDxr && g_use_ray_binning > 0)
-    {
-        if (g_ray_mapping_dirty)
-        {
-            CE(g_command_list->Reset(g_command_allocator, nullptr));
-
-            glm::vec4*  mapped{};  // Normal and T
-            D3D12_RANGE read_range{};
-            read_range.Begin = 0;
-            read_range.End   = sizeof(float) * 3 * RT_W * RT_H;
-            g_hitpos_ao_readback->Map(0, &read_range, (void**)(&mapped));
-            std::vector<std::pair<glm::vec4, int>> tmp;
-
-            for (int i = 0; i < RT_W * RT_H; i++)
-            {
-                glm::vec4 nt   = mapped[i];
-                int       seed = TEA(i, 0, 16).x;
-                glm::vec3 dir  = SampleHemisphereCosine(glm::vec3(nt), seed);
-                tmp.push_back(std::make_pair(glm::vec4(dir, nt.w), i));
-            }
-            g_hitpos_ao_readback->Unmap(0, nullptr);
-            
-            // Global two-point ... ?
-            if (g_use_ray_binning == 2)
-            {
-                std::vector<std::pair<unsigned, int>> tmp1;
-                for (int i = 0; i < RT_W * RT_H; i++)
-                {
-                    float dx = (float(i % RT_W) + 0.5f) / RT_W * 2 - 1;
-                    float dy = (float(i / RT_W) + 0.5f) / RT_H * 2 - 1;
-                    dy *= -1;
-                    if (g_invert_y)
-                        dy *= -1;
-                    glm::vec3 d(dx, dy, 1);
-                    glm::vec3 tgt = TransformPosition(g_inv_proj, d);
-                    glm::vec3 dir = TransformDirection(g_inv_view, glm::normalize(tgt));
-                    
-                    std::pair<glm::vec4, int>& entry = tmp[i];
-
-                    glm::vec3 o = g_cam_pos + (dir * entry.first.w);
-                    glm::vec3 ao_d = glm::vec3(entry.first);
-                    glm::vec3 t = o + ao_d * 10.0f;
-
-                    glm::vec3 t01    = Constrain((t - g_scene_aabb_min) / (g_scene_aabb_max - g_scene_aabb_min));
-                    int       code_t = (int(32 * t01.x) << 10) | (int(32 * t01.y) << 5) | (int(32 * t01.z));
-                    glm::vec3 o01    = Constrain((o - g_scene_aabb_min) / (g_scene_aabb_max - g_scene_aabb_min));
-                    int       code_o = (int(64 * o01.x) << 11) | (int(64 * o01.y) << 5) | (int(32 * o01.z));
-                    unsigned sort_key = (((code_o >> 14) & 7) << 29) |
-                                   (((code_t >> 12) & 7) << 26) |
-                                   (((code_o >> 11) & 7) << 23) |
-                                   (((code_t >>  9) & 7) << 20) |
-                                   (((code_o >>  8) & 7) << 17) |
-                                   (((code_t >>  6) & 7) << 14) |
-                                   (((code_o >>  5) & 7) << 11) |
-                                   (((code_t >>  3) & 7) <<  8) |
-                                   (((code_o >>  2) & 7) <<  5) |
-                                   (((code_t      ) & 7) <<  3) |
-                                   (((code_o      ) & 3));
-                    tmp1.push_back(std::make_pair(sort_key, i));
-
-                    if (i % 100 == 0)
-                        printf("(%g,%g), code_o=0x%08x, code_t=0x%08x, sortkey=0x%08x\n", dx, dy, code_o, code_t, sort_key);
-                }
-                sort(tmp1.begin(), tmp1.end());
-                std::vector<std::pair<glm::vec4, int>> tmp2;
-                for (const auto& x : tmp1)
-                {
-                    tmp2.push_back(tmp.at(x.second));
-                }
-                tmp = tmp2;
-            }
-
-            // Sorting happens here
-            const int BLK_W = 32, BLK_H = 32;
-            for (int y0 = 0; y0 < RT_H; y0 += BLK_H)
-            {
-                for (int x0 = 0; x0 < RT_W; x0 += BLK_W)
-                {
-                    // Record original data
-                    std::vector<std::pair<glm::vec4, int>> block;
-                    for (int y1 = 0; y1 < BLK_H; y1++)
-                    {
-                        for (int x1 = 0; x1 < BLK_W; x1++)
-                        {
-                            if (x1 + x0 >= RT_W || y1 + y0 >= RT_H)
-                                continue;
-                            block.push_back(tmp[(x1 + x0) + (y1 + y0) * RT_W]);
-                        }
-                    }
-
-                    // Sort block
-                    if (g_use_ray_binning == 3)
-                    {
-                        const int NUM_BINS_W = 4, NUM_BINS_H = 4;
-                        std::vector<int> occs(NUM_BINS_W * NUM_BINS_H);
-                        std::vector<int> bin_idxes;
-                        for (const auto& x : block)
-                        {
-                            glm::vec2 enc = OctEncode(glm::vec3(x.first));
-                            int       bidx = NUM_BINS_H * NUM_BINS_W - 1;
-                            if (!isnan(enc.x))
-                            {
-                                int gridx = int(enc.x * NUM_BINS_W);
-                                int gridy = int(enc.y * NUM_BINS_H);
-                                assert(gridx >= 0 && gridx < NUM_BINS_W);
-                                assert(gridy >= 0 && gridy < NUM_BINS_H);
-                                bidx = gridy * NUM_BINS_W + gridx;
-                            }
-                            bin_idxes.push_back(bidx);
-                            occs[bidx]++;
-                        }
-
-                        std::vector<int> offsets(NUM_BINS_W * NUM_BINS_H);
-
-                        int s = 0;
-                        for (int i = 0; i < NUM_BINS_W * NUM_BINS_H; i++)
-                        {
-                            offsets[i] = s;
-                            s += occs[i];
-                        }
-
-                        std::vector<std::pair<glm::vec4, int>> block_binned(BLK_W * BLK_H);
-                        for (int i = 0; i < block.size(); i++)
-                        {
-                            int bidx = bin_idxes[i];
-                            block_binned[offsets[bidx]++] = block[i];
-                        }
-                        block = block_binned;
-                    }
-
-                    // Put back
-                    int bidx = 0;
-                    for (int y1 = 0; y1 < BLK_H; y1++)
-                    {
-                        for (int x1 = 0; x1 < BLK_W; x1++)
-                        {
-                            if (x1 + x0 >= RT_W || y1 + y0 >= RT_H)
-                                continue;
-                            tmp[(x1 + x0) + (y1 + y0) * RT_W] = block[bidx];
-                            bidx++;
-                        }
-                    }
-                }
-            }
-
-            std::vector<glm::vec3> raydirs;
-            std::vector<int>       raymappings;
-            for (int i = 0; i < RT_W * RT_H; i++)
-            {
-                raydirs.push_back(glm::vec3(tmp[i].first));
-                raymappings.push_back(tmp[i].second);
-            }
-
-            void* mapped1;
-            g_aoray_dirs_upload->Map(0, nullptr, &mapped1);
-            memcpy(mapped1, raydirs.data(), sizeof(glm::vec3) * RT_W * RT_H);
-            g_aoray_dirs_upload->Unmap(0, nullptr);
-
-            g_ray_mapping_upload->Map(0, nullptr, &mapped1);
-            memcpy(mapped1, raymappings.data(), sizeof(int) * RT_W * RT_H);
-            g_ray_mapping_upload->Unmap(0, nullptr);
-
-            D3D12_RESOURCE_BARRIER bar{};
-            bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            bar.Transition.pResource   = g_aoray_dirs;
-            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
-            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_command_list->ResourceBarrier(1, &bar);
-            g_command_list->CopyResource(g_aoray_dirs, g_aoray_dirs_upload);
-
-            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-            g_command_list->ResourceBarrier(1, &bar);
-
-            bar.Transition.pResource   = g_ray_mapping;
-            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
-            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_command_list->ResourceBarrier(1, &bar);
-            g_command_list->CopyResource(g_ray_mapping, g_ray_mapping_upload);
-
-            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-            g_command_list->ResourceBarrier(1, &bar);
-
-            g_ray_mapping_dirty = false;
-
-            CE(g_command_list->Close());
-            g_command_queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_command_list);
-            WaitForPreviousFrame();
-            CE(g_command_allocator->Reset());
-        }
-    }
-
     // Read timer
     float frame_time_ms = 0.0f;
     if (g_render_backend == RenderBackend::kDxr)
@@ -3018,15 +3538,25 @@ void Render()
         uint64_t freq{0};
         g_command_queue->GetTimestampFrequency(&freq);
 
-        uint64_t timestamps[2];
+        uint64_t timestamps[4]{};
         g_query_readback_buffer->Map(0, nullptr, (void**)(&mapped));
-        memcpy(timestamps, mapped, 2 * sizeof(uint64_t));
+        memcpy(timestamps, mapped, sizeof(timestamps));
         g_query_readback_buffer->Unmap(0, nullptr);
         float sec = (timestamps[1] - timestamps[0]) * 1.0f / freq;
 
         g_frame_time.AddSample(sec);
         frame_time_ms = g_frame_time.GetFrameTime() * 1000.0f;
         g_app_state.last_gpu_frame_ms = frame_time_ms;
+        if (!g_use_ao && g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+        {
+            const float compact_dispatch_sec = (timestamps[3] - timestamps[2]) * 1.0f / freq;
+            g_compact_dispatch_rays_time.AddSample(compact_dispatch_sec);
+            g_app_state.last_gpu_compact_dispatch_rays_ms = g_compact_dispatch_rays_time.GetFrameTime() * 1000.0f;
+        }
+        else
+        {
+            g_app_state.last_gpu_compact_dispatch_rays_ms = 0.0f;
+        }
     }
     if (g_frame_time.ShouldUpdate())
     {
@@ -3080,10 +3610,6 @@ void Render()
             if (g_force_hitpos_dirty)
             {
                 ss << " force_hitpos_dirty";
-            }
-            if (g_use_ray_binning)
-            {
-                ss << " ray_binning=" << std::to_string(g_use_ray_binning);
             }
             glfwSetWindowTitle(g_window, ss.str().c_str());
         }
@@ -3620,6 +4146,8 @@ int main(int argc, char** argv)
             g_set_steady_power_state = true;
         }
     }
+    g_rt_width_input = RT_W;
+    g_rt_height_input = RT_H;
 
     if (!std::filesystem::exists(g_rra_file_name))
     {
@@ -3635,6 +4163,7 @@ int main(int argc, char** argv)
     g_cpu_worker_thread = std::thread(CpuWorkerMain);
 
     CreateRTPipeline();
+    CreateCompactReducePipeline();
     CreateShaderBindingTable();
 
     std::thread thd([&]() {

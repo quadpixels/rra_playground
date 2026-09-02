@@ -62,6 +62,7 @@ struct AppState
     std::string  last_error;
     std::string  status_line;
     float        last_gpu_frame_ms{0.0f};
+    float        last_gpu_compact_dispatch_rays_ms{0.0f};
     uint64_t     cpu_bvh_node_count{0};
     uint64_t     cpu_bvh_primitive_count{0};
     uint32_t     cpu_bvh_fanout{2};

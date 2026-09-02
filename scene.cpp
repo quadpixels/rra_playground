@@ -311,6 +311,9 @@ bool LoadSceneFromRra(const char* rra_file_name, AppState* app_state, SceneData*
                                     out_ray.tmax                    = r.t_max;
                                     out_ray.ray_flags               = r.ray_flags;
                                     out_ray.instance_inclusion_mask = r.cull_mask;
+                                    out_ray.sbt_record_offset       = r.sbt_record_offset;
+                                    out_ray.sbt_record_stride       = r.sbt_record_stride;
+                                    out_ray.miss_index              = r.miss_index;
                                     dispatch.rays.push_back(out_ray);
                                 }
                             }

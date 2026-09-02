@@ -28,6 +28,23 @@ void RayGen()
     bool should_skip = false;
     RayDesc ray;
 
+    if ((load_ray_from_buffer & 4) != 0)
+    {
+        const uint compact_id = compact_batch_base + DispatchRaysIndex().x;
+        RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[compact_id];
+        ray.Origin = rpbm.origin;
+        ray.Direction = rpbm.direction;
+        ray.TMin = rpbm.tmin;
+        ray.TMax = rpbm.tmax;
+
+        HitInfo payload = { float4(0, 0, 0, 1), 0 };
+        TraceRay(Scene,
+            RAY_FLAG_NONE,
+            0xFF, 0, 0, 0, ray, payload);
+        CompactRayResults[compact_id] = payload.colorAndDistance;
+        return;
+    }
+
     if (load_ray_from_buffer > 0)
     {
         const uint2 dixy = DispatchRaysIndex().xy;
