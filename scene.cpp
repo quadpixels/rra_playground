@@ -29,11 +29,13 @@ const std::map<std::string, CamParams> kCameraParams = {
     {"PortRoyal", {glm::vec3(-7.2252469f, 0.8361527f, 25.2023430f), glm::vec3(-6.8860960f, 0.8613553f, 24.2284565f), glm::vec3(0, 1, 0), true}},
     {"DXRFeatureTest", {glm::vec3(-6.1447086f, 2.7448003f, -11.9588842f), glm::vec3(-6.1102533f, 2.7394657f, -11.9192486f), glm::vec3(0, 1, 0), true}},
     {"Cyberpunk2077", {glm::vec3(667.6618652f, -804.2122192f, 128.7313995f), glm::vec3(666.0505371f, -802.7095947f, 128.0240326f), glm::vec3(0, 0, 1), true}},
-    {"RealTimeDenoisedAmbientOcclusion", {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
+    {"RealTimeDenoisedAmbientOcclusion",
+     {glm::vec3(-43.5119209f, 24.3670177f, -29.0387344f), glm::vec3(-43.2385712f, 24.1981163f, -28.8011036f), glm::vec3(0, 1, 0), true}},
     {"b1-Win64-Shipping", {glm::vec3(-32269.8417969f, 9393.68f, -1515.189f), glm::vec3(-32869.87f, 9697.102f, -1436.413f), glm::vec3(0, 0, 1), true}},
     {"VictorStones", {glm::vec3(54.20388f, -360.680725f, 20.8701935f), glm::vec3(93.000f, -316.9831f, 29.51616f), glm::vec3(0, 0, 1), true}},
     {"AncientGame", {glm::vec3(-290.0213013f, 230.9532928f, 341.0099792f), glm::vec3(-344.7103882f, 227.3368835f, 347.0361633f), glm::vec3(0, 0, 1), true}},
     {"ThreeTriangles", {glm::vec3(60.1231461f, 90.5544434f, 25.7323875f), glm::vec3(60.0977364f, 86.9188461f, 25.4270802f), glm::vec3(0, 0, 1), true}},
+    {"SunTemple", {glm::vec3(1.0130761, 5.1694260, 10.8313808), glm::vec3(0.7904339, 4.8443718, 8.5866756), glm::vec3(0, 1, 0), true}},
 };
 
 void SetStatus(AppState* app_state, const std::string& text)
@@ -83,25 +85,19 @@ uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
         float sa = 0.0f;
         RraBlasGetSurfaceArea(blas_index, node, &sa);
         uint32_t tri_count = 0;
-        if (sa > 0.0f && RraBlasGetNodeTriangleCount(blas_index, node, &tri_count) == kRraOk)
+        if (sa > 0.0f && RraBlasGetNodeTriangleCount(blas_index, node, &tri_count) == kRraOk && tri_count > 0)
         {
-            std::vector<VertexPosition> verts(tri_count == 1 ? 3 : 4);
-            if (RraBlasGetNodeVertices(blas_index, node, verts.data()) == kRraOk)
+            std::vector<TriangleVertices> triangles(tri_count);
+            if (RraBlasGetNodeTriangles(blas_index, node, triangles.data()) == kRraOk)
             {
                 out_node.is_leaf         = true;
                 out_node.primitive_start = *triangle_count;
                 out_node.primitive_count = tri_count;
-                if (tri_count >= 1)
+                for (const TriangleVertices& triangle : triangles)
                 {
-                    geom_verts->push_back(glm::vec3(verts[0].x, verts[0].y, verts[0].z));
-                    geom_verts->push_back(glm::vec3(verts[1].x, verts[1].y, verts[1].z));
-                    geom_verts->push_back(glm::vec3(verts[2].x, verts[2].y, verts[2].z));
-                }
-                if (tri_count >= 2)
-                {
-                    geom_verts->push_back(glm::vec3(verts[1].x, verts[1].y, verts[1].z));
-                    geom_verts->push_back(glm::vec3(verts[3].x, verts[3].y, verts[3].z));
-                    geom_verts->push_back(glm::vec3(verts[2].x, verts[2].y, verts[2].z));
+                    geom_verts->push_back(glm::vec3(triangle.a.x, triangle.a.y, triangle.a.z));
+                    geom_verts->push_back(glm::vec3(triangle.b.x, triangle.b.y, triangle.b.z));
+                    geom_verts->push_back(glm::vec3(triangle.c.x, triangle.c.y, triangle.c.z));
                 }
                 *triangle_count += tri_count;
             }

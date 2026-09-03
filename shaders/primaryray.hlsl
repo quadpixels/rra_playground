@@ -9,6 +9,7 @@ struct HitInfo
 {
     float4 colorAndDistance;
     int idx;
+    uint pixel_index;
 };
 
 [shader("raygeneration")]
@@ -37,7 +38,7 @@ void RayGen()
         ray.TMin = rpbm.tmin;
         ray.TMax = rpbm.tmax;
 
-        HitInfo payload = { float4(0, 0, 0, 1), 0 };
+        HitInfo payload = { float4(0, 0, 0, 1), 0, rpbm.original_pixel_index };
         TraceRay(Scene,
             rpbm.ray_flags,
             rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
@@ -65,7 +66,7 @@ void RayGen()
                     ray.TMin = rpbm.tmin;
                     ray.TMax = rpbm.tmax;
 
-                    HitInfo payload = { float4(0, 0, 0, 1), 0 };
+                    HitInfo payload = { float4(0, 0, 0, 1), 0, tidx };
                     TraceRay(Scene,
                         rpbm.ray_flags,
                         rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
@@ -97,7 +98,8 @@ void RayGen()
     
     if (should_skip == false && load_ray_from_buffer == 0)
     {
-        HitInfo payload = { float4(0, 0, 0, 1), 0 };
+        const uint pixel_index = DispatchRaysIndex().x + DispatchRaysIndex().y * rt_w;
+        HitInfo payload = { float4(0, 0, 0, 1), 0, pixel_index };
         TraceRay(Scene,
             RAY_FLAG_NONE,
             0xFF, 0, 0, 0, ray, payload);
@@ -109,7 +111,13 @@ void RayGen()
 [shader("miss")]
 void Miss(inout HitInfo payload : SV_RayPayload)
 {
-    const float2 uv = DispatchRaysIndex().xy * 1.0 / DispatchRaysDimensions().xy;
+    float2 uv = DispatchRaysIndex().xy * 1.0 / DispatchRaysDimensions().xy;
+    if ((load_ray_from_buffer & 4) != 0)
+    {
+        const uint pixel_x = payload.pixel_index % rt_w;
+        const uint pixel_y = payload.pixel_index / rt_w;
+        uv = float2(pixel_x, pixel_y) / float2(rt_w, rt_h);
+    }
     payload.colorAndDistance.x = lerp(0.9, 0.3, uv.y);
     payload.colorAndDistance.y = lerp(0.9, 0.3, uv.y);
     payload.colorAndDistance.z = 0.9;

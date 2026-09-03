@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +43,8 @@
 #include "cpu_renderer.h"
 #include "scene.h"
 
+#include "../frontend/version.h"
+
 #undef min
 #undef max
 
@@ -61,9 +64,11 @@ struct GpuRayInPix
     float    tmax{10000.0f};
     uint32_t ray_flags{0};
     uint32_t instance_inclusion_mask{0xFF};
+    uint32_t original_pixel_index{0};
+    uint32_t pad{0};
 };
 
-static_assert(sizeof(GpuRayInPix) == 40);
+static_assert(sizeof(GpuRayInPix) == 48);
 
 std::vector<RayInPixDumpFileMinimal> g_rays_in_pix_dumpfile_minimal;
 glm::uvec3                         g_ray_in_pix_dispatch_dims;
@@ -85,6 +90,12 @@ bool                                 g_dispatch_ray_mapping_dirty{true};
 bool                                 g_dispatch_ray_gpu_dirty{true};
 bool                                 g_use_ray_in_pix{false};
 bool                                 g_use_gpu_compact_dispatch_rays{false};
+bool                                 g_compact_dispatch_batch_barrier{false};
+bool                                 g_dump_compact_ray_results_requested{false};
+bool                                 g_compact_ray_results_readback_pending{false};
+uint32_t                             g_compact_ray_results_readback_count{0};
+uint64_t                             g_compact_ray_results_readback_size{0};
+std::filesystem::path                g_compact_ray_results_readback_path;
 
 struct CompactDispatchReplayData
 {
@@ -264,6 +275,7 @@ ID3D12Resource* g_compact_ray_pixel_indices_buffer;
 ID3D12Resource* g_compact_batch_pixel_offsets_buffer;
 ID3D12Resource* g_compact_pixel_compact_indices_buffer;
 ID3D12Resource* g_compact_ray_results_buffer;
+ID3D12Resource* g_compact_ray_results_readback_buffer;
 ID3D12Resource* g_compact_accum_color_buffer;
 ID3D12Resource* g_compact_accum_count_buffer;
 std::string    g_adapter_name{"Unknown adapter"};
@@ -564,12 +576,14 @@ void CreateStructuredBufferSrv(ID3D12Resource** resource,
     g_device12->CreateShaderResourceView(*resource, &srv_desc, handle);
 }
 
-std::vector<GpuRayInPix> BuildGpuRayUploadBuffer(const std::vector<RayInPixDumpFileMinimal>& rays)
+std::vector<GpuRayInPix> BuildGpuRayUploadBuffer(const std::vector<RayInPixDumpFileMinimal>& rays,
+                                                 const std::vector<uint32_t>* original_pixel_indices = nullptr)
 {
     std::vector<GpuRayInPix> upload_rays;
     upload_rays.reserve(rays.size());
-    for (const RayInPixDumpFileMinimal& ray : rays)
+    for (uint32_t ray_index = 0; ray_index < rays.size(); ray_index++)
     {
+        const RayInPixDumpFileMinimal& ray = rays[ray_index];
         GpuRayInPix out_ray{};
         out_ray.origin[0] = ray.origin.x;
         out_ray.origin[1] = ray.origin.y;
@@ -581,6 +595,10 @@ std::vector<GpuRayInPix> BuildGpuRayUploadBuffer(const std::vector<RayInPixDumpF
         out_ray.tmax = ray.tmax;
         out_ray.ray_flags = ray.ray_flags;
         out_ray.instance_inclusion_mask = ray.instance_inclusion_mask;
+        if (original_pixel_indices != nullptr && ray_index < original_pixel_indices->size())
+        {
+            out_ray.original_pixel_index = (*original_pixel_indices)[ray_index];
+        }
         upload_rays.push_back(out_ray);
     }
     return upload_rays;
@@ -626,6 +644,98 @@ void CreateStructuredBufferUav(ID3D12Resource** resource, size_t element_size, u
     g_device12->CreateUnorderedAccessView(*resource, nullptr, &uav_desc, handle);
 }
 
+bool EnsureCompactRayResultsReadbackBuffer(uint64_t size_bytes)
+{
+    if (size_bytes == 0 || g_device12 == nullptr)
+    {
+        return false;
+    }
+    if (g_compact_ray_results_readback_buffer != nullptr && g_compact_ray_results_readback_size >= size_bytes)
+    {
+        return true;
+    }
+
+    ReleaseResource(&g_compact_ray_results_readback_buffer);
+    g_compact_ray_results_readback_size = 0;
+
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type                 = D3D12_HEAP_TYPE_READBACK;
+    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    props.CreationNodeMask     = 1;
+    props.VisibleNodeMask      = 1;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment          = 0;
+    desc.Width              = size_bytes;
+    desc.Height             = 1;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    const HRESULT hr = g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_compact_ray_results_readback_buffer));
+    if (FAILED(hr))
+    {
+        char message[160]{};
+        snprintf(message, sizeof(message), "Create compact ray-results readback failed: 0x%08X", static_cast<unsigned int>(hr));
+        g_app_state.SetStatus(message);
+        return false;
+    }
+
+    g_compact_ray_results_readback_size = size_bytes;
+    g_compact_ray_results_readback_buffer->SetName(L"Compact DispatchRays results readback");
+    return true;
+}
+
+void WritePendingCompactRayResultsDump()
+{
+    if (!g_compact_ray_results_readback_pending || g_compact_ray_results_readback_buffer == nullptr)
+    {
+        return;
+    }
+
+    const uint64_t bytes_to_write = static_cast<uint64_t>(g_compact_ray_results_readback_count) * sizeof(float) * 4;
+    if (bytes_to_write == 0)
+    {
+        g_compact_ray_results_readback_pending = false;
+        return;
+    }
+
+    std::filesystem::create_directories(g_compact_ray_results_readback_path.parent_path());
+    void* mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes_to_write)};
+    const HRESULT hr = g_compact_ray_results_readback_buffer->Map(0, &read_range, &mapped);
+    if (FAILED(hr))
+    {
+        char message[160]{};
+        snprintf(message, sizeof(message), "Map compact ray-results readback failed: 0x%08X", static_cast<unsigned int>(hr));
+        g_app_state.SetStatus(message);
+        g_compact_ray_results_readback_pending = false;
+        return;
+    }
+
+    std::ofstream out(g_compact_ray_results_readback_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(bytes_to_write));
+    D3D12_RANGE write_range{0, 0};
+    g_compact_ray_results_readback_buffer->Unmap(0, &write_range);
+
+    std::ofstream meta(g_compact_ray_results_readback_path.string() + ".txt");
+    meta << "format: float4\n";
+    meta << "stride_bytes: " << (sizeof(float) * 4) << "\n";
+    meta << "count: " << g_compact_ray_results_readback_count << "\n";
+    meta << "bytes: " << bytes_to_write << "\n";
+    meta << "index: compact_ray_index\n";
+
+    g_compact_ray_results_readback_pending = false;
+    g_app_state.SetStatus("Compact DispatchRays output dumped to " + g_compact_ray_results_readback_path.string());
+}
+
 void UpdateDispatchRayGpuBuffers()
 {
     if (g_srv_uav_cbv_heap == nullptr || g_device12 == nullptr)
@@ -666,7 +776,8 @@ void UpdateCompactDispatchReplayGpuBuffers()
         BuildCompactDispatchReplay();
     }
 
-    std::vector<GpuRayInPix> upload_rays = BuildGpuRayUploadBuffer(g_compact_dispatch_replay.rays);
+    std::vector<GpuRayInPix> upload_rays = BuildGpuRayUploadBuffer(g_compact_dispatch_replay.rays,
+                                                                   &g_compact_dispatch_replay.pixel_indices);
     CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
                               upload_rays.empty() ? nullptr : upload_rays.data(),
                               sizeof(GpuRayInPix),
@@ -1408,6 +1519,257 @@ void BuildCompactDispatchReplay()
     g_compact_dispatch_replay_dirty = false;
 }
 
+std::string CurrentDumpBaseName()
+{
+    const std::string source = g_scene_data.stats.source_name.empty() ? std::string(g_rra_file_name ? g_rra_file_name : "scene") : g_scene_data.stats.source_name;
+    std::filesystem::path path(source);
+    std::string stem = path.stem().string();
+    if (stem.empty())
+    {
+        stem = "scene";
+    }
+    return stem;
+}
+
+uint32_t FloatBits(float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+struct RayDumpRay
+{
+    float origin[3]{};
+    float tmin{0.0f};
+    float direction[3]{};
+    float tmax{0.0f};
+};
+
+struct RayDumpFlagConfig
+{
+    uint32_t ray_flags{0};
+    uint32_t instance_inc_mask{0};
+    uint32_t padding[2]{};
+};
+
+struct RayDumpPixelRayInfo
+{
+    uint32_t ray_offset{0};
+    uint32_t ray_count{0};
+    uint32_t padding[2]{};
+};
+
+struct RayDumpScatterInfo
+{
+    uint32_t local_ray_index{0};
+    uint32_t compact_ray_index{0};
+    uint32_t pixel_index{0};
+    uint32_t padding{0};
+};
+
+void WriteRayDumpFiles(const std::filesystem::path& dir,
+                       const std::string& prefix,
+                       const std::vector<RayInPixDumpFileMinimal>& rays,
+                       const std::vector<uint32_t>& offsets,
+                       bool hex_text)
+{
+    std::filesystem::create_directories(dir);
+    if (hex_text)
+    {
+        std::ofstream ray_file(dir / (prefix + "_Ray.txt"));
+        std::ofstream pixel_file(dir / (prefix + "_PixelRayInfo.txt"));
+        ray_file << "tmin tmax origin_x origin_y origin_z direction_x direction_y direction_z rayflags ins_ins_mask\n";
+        pixel_file << "ray_offset, ray_count\n";
+
+        for (const RayInPixDumpFileMinimal& ray : rays)
+        {
+            char line[256]{};
+            snprintf(line,
+                     sizeof(line),
+                     "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     FloatBits(ray.tmin),
+                     FloatBits(ray.tmax),
+                     FloatBits(ray.origin.x),
+                     FloatBits(ray.origin.y),
+                     FloatBits(ray.origin.z),
+                     FloatBits(ray.direction.x),
+                     FloatBits(ray.direction.y),
+                     FloatBits(ray.direction.z),
+                     ray.ray_flags,
+                     ray.instance_inclusion_mask);
+            ray_file << line;
+        }
+
+        uint32_t previous_offset = 0;
+        for (uint32_t offset : offsets)
+        {
+            const uint32_t count = offset >= previous_offset ? offset - previous_offset : 0;
+            pixel_file << previous_offset << " " << count << "\n";
+            previous_offset = offset;
+        }
+        return;
+    }
+
+    std::ofstream ray_file(dir / (prefix + "_Ray"), std::ios::binary);
+    std::ofstream flag_file(dir / (prefix + "_FlagConfig"), std::ios::binary);
+    std::ofstream pixel_file(dir / (prefix + "_PixelRayInfo"), std::ios::binary);
+
+    for (const RayInPixDumpFileMinimal& ray : rays)
+    {
+        RayDumpRay dump_ray{};
+        dump_ray.origin[0] = ray.origin.x;
+        dump_ray.origin[1] = ray.origin.y;
+        dump_ray.origin[2] = ray.origin.z;
+        dump_ray.tmin = ray.tmin;
+        dump_ray.direction[0] = ray.direction.x;
+        dump_ray.direction[1] = ray.direction.y;
+        dump_ray.direction[2] = ray.direction.z;
+        dump_ray.tmax = ray.tmax;
+        ray_file.write(reinterpret_cast<const char*>(&dump_ray), sizeof(dump_ray));
+
+        RayDumpFlagConfig flags{};
+        flags.ray_flags = ray.ray_flags;
+        flags.instance_inc_mask = ray.instance_inclusion_mask;
+        flag_file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
+    }
+
+    uint32_t previous_offset = 0;
+    for (uint32_t offset : offsets)
+    {
+        RayDumpPixelRayInfo info{};
+        info.ray_offset = previous_offset;
+        info.ray_count = offset >= previous_offset ? offset - previous_offset : 0;
+        pixel_file.write(reinterpret_cast<const char*>(&info), sizeof(info));
+        previous_offset = offset;
+    }
+}
+
+void WriteCompactIndexDump(const std::filesystem::path& dir, uint32_t batch, uint32_t batch_begin, uint32_t batch_end, bool hex_text)
+{
+    const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
+    const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
+    if (hex_text)
+    {
+        std::ofstream scatter_file(dir / "ScatterMap.txt");
+        scatter_file << "local_ray_index compact_ray_index pixel_index\n";
+        for (uint32_t compact_id = batch_begin; compact_id < batch_end; compact_id++)
+        {
+            scatter_file << (compact_id - batch_begin) << " " << compact_id << " " << g_compact_dispatch_replay.pixel_indices[compact_id] << "\n";
+        }
+
+        std::ofstream range_file(dir / "ReducePixelRanges.txt");
+        range_file << "pixel global_begin global_end\n";
+        for (uint32_t i = range_begin; i < range_end; i++)
+        {
+            const auto& range = g_compact_dispatch_replay.batch_pixel_ranges[i];
+            range_file << range.pixel << " " << range.begin << " " << range.end << "\n";
+        }
+
+        std::ofstream index_file(dir / "ReduceRayIndices.txt");
+        index_file << "compact_ray_index\n";
+        for (uint32_t i = range_begin; i < range_end; i++)
+        {
+            const auto& range = g_compact_dispatch_replay.batch_pixel_ranges[i];
+            for (uint32_t j = range.begin; j < range.end; j++)
+            {
+                index_file << g_compact_dispatch_replay.pixel_compact_indices[j] << "\n";
+            }
+        }
+        return;
+    }
+
+    std::ofstream scatter_file(dir / "ScatterMap", std::ios::binary);
+    for (uint32_t compact_id = batch_begin; compact_id < batch_end; compact_id++)
+    {
+        RayDumpScatterInfo info{};
+        info.local_ray_index = compact_id - batch_begin;
+        info.compact_ray_index = compact_id;
+        info.pixel_index = g_compact_dispatch_replay.pixel_indices[compact_id];
+        scatter_file.write(reinterpret_cast<const char*>(&info), sizeof(info));
+    }
+
+    std::ofstream range_file(dir / "ReducePixelRanges", std::ios::binary);
+    for (uint32_t i = range_begin; i < range_end; i++)
+    {
+        const auto& range = g_compact_dispatch_replay.batch_pixel_ranges[i];
+        range_file.write(reinterpret_cast<const char*>(&range), sizeof(range));
+    }
+
+    std::ofstream index_file(dir / "ReduceRayIndices", std::ios::binary);
+    for (uint32_t i = range_begin; i < range_end; i++)
+    {
+        const auto& range = g_compact_dispatch_replay.batch_pixel_ranges[i];
+        for (uint32_t j = range.begin; j < range.end; j++)
+        {
+            const uint32_t compact_id = g_compact_dispatch_replay.pixel_compact_indices[j];
+            index_file.write(reinterpret_cast<const char*>(&compact_id), sizeof(compact_id));
+        }
+    }
+}
+
+void DumpCurrentDispatchRays(bool hex_text)
+{
+    if (!g_use_ray_in_pix)
+    {
+        g_app_state.SetStatus("Enable dispatch rays before dumping.");
+        return;
+    }
+    if (g_dispatch_ray_mapping_dirty)
+    {
+        RebuildDisplayDispatchRays();
+    }
+    if (g_dispatch_ray_gpu_dirty)
+    {
+        RebuildGpuDispatchRays();
+    }
+    if (g_use_gpu_compact_dispatch_rays && g_compact_dispatch_replay_dirty)
+    {
+        BuildCompactDispatchReplay();
+    }
+
+    const std::string base_name = CurrentDumpBaseName();
+    const std::string mode_name = g_use_gpu_compact_dispatch_rays ? "compact" : "dispatch";
+    const std::filesystem::path out_dir = std::filesystem::path("output") / base_name / ("raytype" + std::to_string(g_selected_dispatch_index)) / mode_name;
+    const std::string prefix = base_name + "_raytype_" + std::to_string(g_selected_dispatch_index);
+
+    if (!g_use_gpu_compact_dispatch_rays)
+    {
+        WriteRayDumpFiles(out_dir, prefix, g_gpu_dispatch_ray_buffer, g_gpu_dispatch_ray_offsets, hex_text);
+        g_app_state.SetStatus(std::string(hex_text ? "Hex" : "Binary") + " dispatch ray dump written to " + out_dir.string());
+        return;
+    }
+
+    std::filesystem::create_directories(out_dir);
+    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+    {
+        const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
+        const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
+        const uint32_t batch_count = batch_end - batch_begin;
+        if (batch_count == 0)
+        {
+            continue;
+        }
+
+        char batch_name[64]{};
+        snprintf(batch_name, sizeof(batch_name), "batch%06u", batch);
+        const std::filesystem::path batch_dir = out_dir / batch_name;
+
+        std::vector<RayInPixDumpFileMinimal> batch_rays(g_compact_dispatch_replay.rays.begin() + batch_begin,
+                                                        g_compact_dispatch_replay.rays.begin() + batch_end);
+        std::vector<uint32_t> batch_offsets(batch_count);
+        for (uint32_t i = 0; i < batch_count; i++)
+        {
+            batch_offsets[i] = i + 1;
+        }
+
+        WriteRayDumpFiles(batch_dir, prefix + "_" + batch_name, batch_rays, batch_offsets, hex_text);
+        WriteCompactIndexDump(batch_dir, batch, batch_begin, batch_end, hex_text);
+    }
+
+    g_app_state.SetStatus(std::string(hex_text ? "Hex" : "Binary") + " compact ray dump written to " + out_dir.string());
+}
+
 std::vector<CpuRay> BuildCpuExternalRays()
 {
     std::vector<CpuRay> rays;
@@ -2040,10 +2402,25 @@ void DrawImGuiPanel()
             ImGui::Text("GPU max rays/pixel: %u", g_gpu_dispatch_ray_max_rays_per_pixel);
             if (g_use_gpu_compact_dispatch_rays)
             {
+                ImGui::Checkbox("Barrier between compact batches", &g_compact_dispatch_batch_barrier);
                 ImGui::Text("Compact batches: %zu", g_compact_dispatch_replay.batch_offsets.empty() ? 0 : g_compact_dispatch_replay.batch_offsets.size() - 1);
                 ImGui::Text("Compact rays: %zu", g_compact_dispatch_replay.rays.size());
                 ImGui::Text("Compact pixel ranges: %zu", g_compact_dispatch_replay.batch_pixel_ranges.size());
                 ImGui::Text("Compact pixel ray indices: %zu", g_compact_dispatch_replay.pixel_compact_indices.size());
+                if (ImGui::Button("Dump compact ray results"))
+                {
+                    g_dump_compact_ray_results_requested = true;
+                    g_app_state.SetStatus("Compact DispatchRays output dump requested.");
+                }
+            }
+            if (ImGui::Button("Dump rays binary"))
+            {
+                DumpCurrentDispatchRays(false);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Dump rays hex"))
+            {
+                DumpCurrentDispatchRays(true);
             }
         }
         if (g_use_ao)
@@ -3435,9 +3812,46 @@ void Render()
                         desc.Height = 1;
                         desc.Depth = 1;
                         g_command_list->DispatchRays(&desc);
+                        if (g_compact_dispatch_batch_barrier)
+                        {
+                            g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                        }
                     }
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
-                    g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                    const bool dump_compact_ray_results_this_frame =
+                        g_dump_compact_ray_results_requested && g_compact_ray_results_buffer != nullptr && !g_compact_dispatch_replay.rays.empty();
+                    if (dump_compact_ray_results_this_frame)
+                    {
+                        const uint64_t dump_size = static_cast<uint64_t>(g_compact_dispatch_replay.rays.size()) * sizeof(float) * 4;
+                        if (EnsureCompactRayResultsReadbackBuffer(dump_size))
+                        {
+                            D3D12_RESOURCE_BARRIER copy_barrier{};
+                            copy_barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            copy_barrier.Transition.pResource   = g_compact_ray_results_buffer;
+                            copy_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+                            g_command_list->CopyBufferRegion(g_compact_ray_results_readback_buffer, 0, g_compact_ray_results_buffer, 0, dump_size);
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+
+                            const std::string base_name = CurrentDumpBaseName();
+                            g_compact_ray_results_readback_path = std::filesystem::path("output") /
+                                                                  base_name /
+                                                                  ("raytype" + std::to_string(g_selected_dispatch_index)) /
+                                                                  "compact" /
+                                                                  "CompactRayResults.bin";
+                            g_compact_ray_results_readback_count = static_cast<uint32_t>(g_compact_dispatch_replay.rays.size());
+                            g_compact_ray_results_readback_pending = true;
+                        }
+                        g_dump_compact_ray_results_requested = false;
+                    }
+                    else
+                    {
+                        g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                    }
 
                     
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
@@ -3672,6 +4086,7 @@ void Render()
             g_app_state.last_gpu_compact_reduce_ms        = 0.0f;
         }
     }
+    WritePendingCompactRayResultsDump();
     if (g_frame_time.ShouldUpdate())
     {
         std::stringstream ss;
@@ -4223,6 +4638,16 @@ void ReadPixBufferDump(const char* filename)
 
 int main(int argc, char** argv)
 {
+    AllocConsole();
+    freopen_s((FILE**)stdin, "CONIN$", "r", stderr);
+    freopen_s((FILE**)stdout, "CONOUT$", "w", stdout);
+    freopen_s((FILE**)stderr, "CONOUT$", "w", stderr);
+
+    printf("RRA Playground!\nRRA library version: %d.%d\nRRA build date: %s\nRRA copyright: %s",
+             PRODUCT_MAJOR_VERSION,
+             PRODUCT_MINOR_VERSION,
+             PRODUCT_BUILD_DATE_STRING,
+             PRODUCT_COPYRIGHT_STRING);
     if (argc == 3 && !strcmp(argv[1], "-pixbufferdump"))
     {
         ReadPixBufferDump(argv[2]);

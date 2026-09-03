@@ -6,6 +6,8 @@ struct RayInPixBufferMinimal
     float tmax;
     uint ray_flags;
     uint instance_inclusion_mask;
+    uint original_pixel_index;
+    uint pad;
 };
 
 RaytracingAccelerationStructure Scene : register(t0, space0);

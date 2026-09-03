@@ -34,7 +34,7 @@ include_directories(AFTER
   ${RRA_PATH}/external/third_party
   ${RRA_PATH}/external/third_party/glm
   ${RRA_PATH}/source/backend
-  )
+)
 
 # Set debugging CWD
 set_target_properties(MyRRALoader PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:MyRRALoader>")
