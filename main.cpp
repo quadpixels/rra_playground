@@ -145,7 +145,10 @@ struct FrameTime
 };
 
 FrameTime g_frame_time;
+FrameTime g_dispatch_rays_time;
 FrameTime g_compact_dispatch_rays_time;
+FrameTime g_compact_scatter_time;
+FrameTime g_compact_reduce_time;
 
 struct Vertex
 {
@@ -1774,17 +1777,64 @@ void DrawImGuiPanel()
     ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime"))
     {
+
+        auto check_hover_times = [&]() {
+            bool is_compact = (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                if (is_compact)
+                {
+                    ImGui::Text("Click to copy frametime, dispatch_rays_time, scatter_time to clipboard");
+                }
+                else
+                {
+                    ImGui::Text("Click to copy frametime to clipboard");
+                }
+                ImGui::EndTooltip();
+                if (ImGui::IsItemClicked())
+                {
+                    char buf[200];
+                    if (is_compact)
+                    {
+                        snprintf(buf, sizeof(buf), "%g", g_app_state.last_gpu_frame_ms);
+                    }
+                    else
+                    {
+                        snprintf(buf, sizeof(buf), "%g, %g, %g, %g", 
+                          g_app_state.last_gpu_frame_ms, 
+                          g_app_state.last_gpu_compact_dispatch_rays_ms, 
+                          g_app_state.last_gpu_compact_scatter_ms,
+                          g_app_state.last_gpu_compact_reduce_ms
+                        );
+                    }
+                    CopyToClipboard(std::string(buf));
+                }
+            }
+        };
+
         ImGui::Text("Stage: %s", ToString(g_app_state.scene_stage.load()));
         ImGui::Text("Adapter: %s", g_adapter_name.c_str());
-        ImGui::Text("GPU frame: %.3f ms", g_app_state.last_gpu_frame_ms);
         bool stable_power_state = g_set_steady_power_state;
         if (ImGui::Checkbox("Stable power state", &stable_power_state))
         {
             ApplyStablePowerState(stable_power_state);
         }
+        ImGui::Text("GPU frame:                %.3f ms", g_app_state.last_gpu_frame_ms);
+        check_hover_times();
         if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
         {
             ImGui::Text("GPU compact DispatchRays: %.3f ms", g_app_state.last_gpu_compact_dispatch_rays_ms);
+            check_hover_times();
+            ImGui::Text("GPU compact Scatter     : %.3f ms", g_app_state.last_gpu_compact_scatter_ms);
+            check_hover_times();
+            ImGui::Text("GPU compact Reduce      : %.3f ms", g_app_state.last_gpu_compact_reduce_ms);
+            check_hover_times();
+        }
+        else
+        {
+            ImGui::Text("GPU DispatchRays:         %.3f ms", g_app_state.last_gpu_dispatch_rays_ms);
+            check_hover_times();
         }
         ImGui::Text("Render: %dx%d -> %dx%d", RT_W, RT_H, WIN_W, WIN_H);
         ImGui::PushItemWidth(90);
@@ -2551,7 +2601,7 @@ void InitDX12Stuff()
 
     // Query heap
     D3D12_QUERY_HEAP_DESC qhd{};
-    qhd.Count    = 4;
+    qhd.Count    = 8;
     qhd.Type     = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qhd.NodeMask = 0;
     CE(g_device12->CreateQueryHeap(&qhd, IID_PPV_ARGS(&g_query_heap)));
@@ -2560,7 +2610,9 @@ void InitDX12Stuff()
     props.Type     = D3D12_HEAP_TYPE_READBACK;
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Format    = DXGI_FORMAT_UNKNOWN;
-    desc.Width     = sizeof(uint64_t) * 4;
+
+    desc.Width     = sizeof(uint64_t) * 8;  // [0]=FrameStart, [1]=FrameEnd  <-- For all cases
+                                            // [2]=DispatchRaysStart, [3]=DispatchRaysEnd, [4]=ScatterBegin, [5]=ScatterEnd, [6]=ReduceBegin, [7]=ReduceEnd  <-- Only when compacting
     desc.Flags     = D3D12_RESOURCE_FLAG_NONE;
     CE(g_device12->CreateCommittedResource(
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_query_readback_buffer)));
@@ -3387,6 +3439,8 @@ void Render()
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
                     g_command_list->ResourceBarrier(1, &uav_barriers[0]);
 
+                    
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
                     for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
                     {
                         const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
@@ -3411,7 +3465,9 @@ void Render()
                         g_command_list->Dispatch((range_count + 63) / 64, 1, 1);
                         g_command_list->ResourceBarrier(2, &uav_barriers[1]);
                     }
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 5);
 
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 6);
                     g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
                     g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
                     g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
@@ -3422,13 +3478,16 @@ void Render()
                     compact_constants.compact_mode = 2;
                     g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
                     g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 7);
                 }
                 else
                 {
                     desc.Width                                  = RT_W;
                     desc.Height                                 = RT_H;
                     desc.Depth                                  = 1;
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
                     g_command_list->DispatchRays(&desc);
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
                 }
             }
             else
@@ -3486,7 +3545,7 @@ void Render()
             g_command_list->ResolveQueryData(g_query_heap,
                                              D3D12_QUERY_TYPE_TIMESTAMP,
                                              0,
-                                             measure_compact_dispatch_rays ? 4 : 2,
+                                             measure_compact_dispatch_rays ? 8 : 4,
                                              g_query_readback_buffer,
                                              0);
 
@@ -3574,24 +3633,43 @@ void Render()
         uint64_t freq{0};
         g_command_queue->GetTimestampFrequency(&freq);
 
-        uint64_t timestamps[4]{};
+        uint64_t timestamps[8]{};
         g_query_readback_buffer->Map(0, nullptr, (void**)(&mapped));
         memcpy(timestamps, mapped, sizeof(timestamps));
         g_query_readback_buffer->Unmap(0, nullptr);
         float sec = (timestamps[1] - timestamps[0]) * 1.0f / freq;
 
         g_frame_time.AddSample(sec);
+
+        // Update of the following FrameTime's should be synchronized
         frame_time_ms = g_frame_time.GetFrameTime() * 1000.0f;
+        const float compact_dispatch_rays_time = g_compact_dispatch_rays_time.GetFrameTime();
+        const float scatter_time               = g_compact_scatter_time.GetFrameTime();
+        const float dispatch_rays_time         = g_dispatch_rays_time.GetFrameTime();
+        const float reduce_time                = g_compact_reduce_time.GetFrameTime();
+
         g_app_state.last_gpu_frame_ms = frame_time_ms;
         if (!g_use_ao && g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
         {
             const float compact_dispatch_sec = (timestamps[3] - timestamps[2]) * 1.0f / freq;
             g_compact_dispatch_rays_time.AddSample(compact_dispatch_sec);
-            g_app_state.last_gpu_compact_dispatch_rays_ms = g_compact_dispatch_rays_time.GetFrameTime() * 1000.0f;
+            const float compact_scatter_sec = (timestamps[5] - timestamps[4]) * 1.0f / freq;
+            g_compact_scatter_time.AddSample(compact_scatter_sec);
+            const float compact_reduce_sec                = (timestamps[7] - timestamps[6]) * 1.0f / freq;
+            g_compact_reduce_time.AddSample(compact_reduce_sec);
+            g_app_state.last_gpu_compact_dispatch_rays_ms = compact_dispatch_rays_time * 1000.0f;
+            g_app_state.last_gpu_compact_scatter_ms       = scatter_time * 1000.0f;
+            g_app_state.last_gpu_compact_reduce_ms        = reduce_time * 1000.0f;
+            g_app_state.last_gpu_dispatch_rays_ms         = 0.0f;
         }
         else
         {
+            const float dispatch_sec                      = (timestamps[3] - timestamps[2]) * 1.0f / freq;
+            g_dispatch_rays_time.AddSample(dispatch_sec);
+            g_app_state.last_gpu_dispatch_rays_ms         = dispatch_rays_time * 1000.0f;
             g_app_state.last_gpu_compact_dispatch_rays_ms = 0.0f;
+            g_app_state.last_gpu_compact_scatter_ms       = 0.0f;
+            g_app_state.last_gpu_compact_reduce_ms        = 0.0f;
         }
     }
     if (g_frame_time.ShouldUpdate())
