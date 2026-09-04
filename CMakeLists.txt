@@ -93,3 +93,9 @@ add_custom_command(
     COMMAND_EXPAND_LISTS
     COMMENT "Copying shaders to the binary directory"
 )
+
+# For checking Compact results
+add_executable(CompactResultCheck
+  compact_result_check.cpp
+  lodepng.cpp
+)

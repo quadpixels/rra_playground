@@ -81,6 +81,7 @@ std::vector<uint32_t>                g_gpu_dispatch_ray_offsets;
 glm::uvec3                           g_gpu_dispatch_ray_dims{0};
 uint32_t                             g_gpu_dispatch_ray_active_pixels{0};
 uint32_t                             g_gpu_dispatch_ray_max_rays_per_pixel{0};
+int                                  g_selected_ray_type_index{0};
 int                                  g_selected_dispatch_index{0};
 int                                  g_dispatch_ray_layout_mode{0};
 int                                  g_dispatch_reflow_block_w{16};
@@ -90,12 +91,13 @@ bool                                 g_dispatch_ray_mapping_dirty{true};
 bool                                 g_dispatch_ray_gpu_dirty{true};
 bool                                 g_use_ray_in_pix{false};
 bool                                 g_use_gpu_compact_dispatch_rays{false};
+bool                                 g_compact_sort_by_sbt_entry{true};
 bool                                 g_compact_dispatch_batch_barrier{false};
-bool                                 g_dump_compact_ray_results_requested{false};
-bool                                 g_compact_ray_results_readback_pending{false};
-uint32_t                             g_compact_ray_results_readback_count{0};
-uint64_t                             g_compact_ray_results_readback_size{0};
-std::filesystem::path                g_compact_ray_results_readback_path;
+bool                                 g_dump_ray_results_requested{false};
+bool                                 g_ray_results_readback_pending{false};
+uint32_t                             g_ray_results_readback_count{0};
+uint64_t                             g_ray_results_readback_size{0};
+std::filesystem::path                g_ray_results_readback_path;
 
 struct CompactDispatchReplayData
 {
@@ -278,6 +280,15 @@ ID3D12Resource* g_compact_ray_results_buffer;
 ID3D12Resource* g_compact_ray_results_readback_buffer;
 ID3D12Resource* g_compact_accum_color_buffer;
 ID3D12Resource* g_compact_accum_count_buffer;
+ID3D12Resource* g_ray_results_texture_readback_buffer;
+uint64_t        g_ray_results_texture_readback_size{0};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_ray_results_texture_readback_footprint{};
+UINT            g_ray_results_texture_readback_rows{0};
+UINT64          g_ray_results_texture_readback_row_size{0};
+bool            g_ray_results_texture_readback_pending{false};
+uint32_t        g_ray_results_texture_readback_width{0};
+uint32_t        g_ray_results_texture_readback_height{0};
+std::filesystem::path g_ray_results_texture_readback_path;
 std::string    g_adapter_name{"Unknown adapter"};
 
 bool g_use_ao{false};
@@ -650,13 +661,13 @@ bool EnsureCompactRayResultsReadbackBuffer(uint64_t size_bytes)
     {
         return false;
     }
-    if (g_compact_ray_results_readback_buffer != nullptr && g_compact_ray_results_readback_size >= size_bytes)
+    if (g_compact_ray_results_readback_buffer != nullptr && g_ray_results_readback_size >= size_bytes)
     {
         return true;
     }
 
     ReleaseResource(&g_compact_ray_results_readback_buffer);
-    g_compact_ray_results_readback_size = 0;
+    g_ray_results_readback_size = 0;
 
     D3D12_HEAP_PROPERTIES props{};
     props.Type                 = D3D12_HEAP_TYPE_READBACK;
@@ -688,26 +699,26 @@ bool EnsureCompactRayResultsReadbackBuffer(uint64_t size_bytes)
         return false;
     }
 
-    g_compact_ray_results_readback_size = size_bytes;
+    g_ray_results_readback_size = size_bytes;
     g_compact_ray_results_readback_buffer->SetName(L"Compact DispatchRays results readback");
     return true;
 }
 
 void WritePendingCompactRayResultsDump()
 {
-    if (!g_compact_ray_results_readback_pending || g_compact_ray_results_readback_buffer == nullptr)
+    if (!g_ray_results_readback_pending || g_compact_ray_results_readback_buffer == nullptr)
     {
         return;
     }
 
-    const uint64_t bytes_to_write = static_cast<uint64_t>(g_compact_ray_results_readback_count) * sizeof(float) * 4;
+    const uint64_t bytes_to_write = static_cast<uint64_t>(g_ray_results_readback_count) * sizeof(float) * 4;
     if (bytes_to_write == 0)
     {
-        g_compact_ray_results_readback_pending = false;
+        g_ray_results_readback_pending = false;
         return;
     }
 
-    std::filesystem::create_directories(g_compact_ray_results_readback_path.parent_path());
+    std::filesystem::create_directories(g_ray_results_readback_path.parent_path());
     void* mapped = nullptr;
     D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes_to_write)};
     const HRESULT hr = g_compact_ray_results_readback_buffer->Map(0, &read_range, &mapped);
@@ -716,24 +727,186 @@ void WritePendingCompactRayResultsDump()
         char message[160]{};
         snprintf(message, sizeof(message), "Map compact ray-results readback failed: 0x%08X", static_cast<unsigned int>(hr));
         g_app_state.SetStatus(message);
-        g_compact_ray_results_readback_pending = false;
+        g_ray_results_readback_pending = false;
         return;
     }
 
-    std::ofstream out(g_compact_ray_results_readback_path, std::ios::binary);
+    std::ofstream out(g_ray_results_readback_path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(bytes_to_write));
+
+    const uint8_t* result_bytes = reinterpret_cast<const uint8_t*>(mapped);
+    const std::filesystem::path compact_dir = g_ray_results_readback_path.parent_path();
+    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+    {
+        const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
+        const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
+        if (batch_end <= batch_begin || batch_begin >= g_ray_results_readback_count)
+        {
+            continue;
+        }
+
+        const uint32_t clamped_batch_end = std::min(batch_end, g_ray_results_readback_count);
+        const uint64_t batch_byte_offset = static_cast<uint64_t>(batch_begin) * sizeof(float) * 4;
+        const uint64_t batch_bytes = static_cast<uint64_t>(clamped_batch_end - batch_begin) * sizeof(float) * 4;
+
+        char batch_name[64]{};
+        snprintf(batch_name, sizeof(batch_name), "batch%06u", batch);
+        const std::filesystem::path batch_dir = compact_dir / batch_name;
+        std::filesystem::create_directories(batch_dir);
+
+        const std::filesystem::path batch_path = batch_dir / "CompactRayResults.bin";
+        std::ofstream batch_out(batch_path, std::ios::binary);
+        batch_out.write(reinterpret_cast<const char*>(result_bytes + batch_byte_offset), static_cast<std::streamsize>(batch_bytes));
+
+        std::ofstream batch_meta(batch_path.string() + ".txt");
+        batch_meta << "format: float4\n";
+        batch_meta << "stride_bytes: " << (sizeof(float) * 4) << "\n";
+        batch_meta << "batch: " << batch << "\n";
+        batch_meta << "compact_begin: " << batch_begin << "\n";
+        batch_meta << "compact_end: " << clamped_batch_end << "\n";
+        batch_meta << "count: " << (clamped_batch_end - batch_begin) << "\n";
+        batch_meta << "bytes: " << batch_bytes << "\n";
+        batch_meta << "index: local_ray_index = compact_ray_index - compact_begin\n";
+    }
+
     D3D12_RANGE write_range{0, 0};
     g_compact_ray_results_readback_buffer->Unmap(0, &write_range);
 
-    std::ofstream meta(g_compact_ray_results_readback_path.string() + ".txt");
+    std::ofstream meta(g_ray_results_readback_path.string() + ".txt");
     meta << "format: float4\n";
     meta << "stride_bytes: " << (sizeof(float) * 4) << "\n";
-    meta << "count: " << g_compact_ray_results_readback_count << "\n";
+    meta << "count: " << g_ray_results_readback_count << "\n";
     meta << "bytes: " << bytes_to_write << "\n";
     meta << "index: compact_ray_index\n";
+    meta << "rendertarget size: " << RT_W << " x " << RT_H << "\n";
 
-    g_compact_ray_results_readback_pending = false;
-    g_app_state.SetStatus("Compact DispatchRays output dumped to " + g_compact_ray_results_readback_path.string());
+    g_ray_results_readback_pending = false;
+    g_app_state.SetStatus("Compact DispatchRays output dumped to " + g_ray_results_readback_path.string());
+}
+
+bool EnsureRayResultsTextureReadbackBuffer()
+{
+    if (g_device12 == nullptr || RT_W <= 0 || RT_H <= 0)
+    {
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC texture_desc{};
+    texture_desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Alignment        = 0;
+    texture_desc.Width            = static_cast<UINT64>(RT_W);
+    texture_desc.Height           = static_cast<UINT>(RT_H);
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels        = 1;
+    texture_desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.SampleDesc.Quality = 0;
+    texture_desc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texture_desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    UINT64 total_size = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    g_device12->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &rows, &row_size, &total_size);
+
+    if (g_ray_results_texture_readback_buffer != nullptr && g_ray_results_texture_readback_size >= total_size)
+    {
+        g_ray_results_texture_readback_footprint = footprint;
+        g_ray_results_texture_readback_rows = rows;
+        g_ray_results_texture_readback_row_size = row_size;
+        return true;
+    }
+
+    ReleaseResource(&g_ray_results_texture_readback_buffer);
+    g_ray_results_texture_readback_size = 0;
+
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type                 = D3D12_HEAP_TYPE_READBACK;
+    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    props.CreationNodeMask     = 1;
+    props.VisibleNodeMask      = 1;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Alignment          = 0;
+    buffer_desc.Width              = total_size;
+    buffer_desc.Height             = 1;
+    buffer_desc.DepthOrArraySize   = 1;
+    buffer_desc.MipLevels          = 1;
+    buffer_desc.Format             = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count   = 1;
+    buffer_desc.SampleDesc.Quality = 0;
+    buffer_desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    const HRESULT hr = g_device12->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_ray_results_texture_readback_buffer));
+    if (FAILED(hr))
+    {
+        char message[160]{};
+        snprintf(message, sizeof(message), "Create RayResults texture readback failed: 0x%08X", static_cast<unsigned int>(hr));
+        g_app_state.SetStatus(message);
+        return false;
+    }
+
+    g_ray_results_texture_readback_size = total_size;
+    g_ray_results_texture_readback_footprint = footprint;
+    g_ray_results_texture_readback_rows = rows;
+    g_ray_results_texture_readback_row_size = row_size;
+    g_ray_results_texture_readback_buffer->SetName(L"DispatchRays texture output readback");
+    return true;
+}
+
+void WritePendingRayResultsTextureDump()
+{
+    if (!g_ray_results_texture_readback_pending || g_ray_results_texture_readback_buffer == nullptr)
+    {
+        return;
+    }
+
+    std::filesystem::create_directories(g_ray_results_texture_readback_path.parent_path());
+
+    void* mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(g_ray_results_texture_readback_size)};
+    const HRESULT hr = g_ray_results_texture_readback_buffer->Map(0, &read_range, &mapped);
+    if (FAILED(hr))
+    {
+        char message[160]{};
+        snprintf(message, sizeof(message), "Map RayResults texture readback failed: 0x%08X", static_cast<unsigned int>(hr));
+        g_app_state.SetStatus(message);
+        g_ray_results_texture_readback_pending = false;
+        return;
+    }
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(mapped) + g_ray_results_texture_readback_footprint.Offset;
+    const uint32_t width = g_ray_results_texture_readback_width;
+    const uint32_t height = g_ray_results_texture_readback_height;
+    const uint64_t src_pitch = g_ray_results_texture_readback_footprint.Footprint.RowPitch;
+    const uint64_t tight_pitch = static_cast<uint64_t>(width) * 4;
+
+    std::ofstream out(g_ray_results_texture_readback_path, std::ios::binary);
+    for (uint32_t y = 0; y < height; y++)
+    {
+        out.write(reinterpret_cast<const char*>(src + y * src_pitch), static_cast<std::streamsize>(tight_pitch));
+    }
+
+    D3D12_RANGE write_range{0, 0};
+    g_ray_results_texture_readback_buffer->Unmap(0, &write_range);
+
+    std::ofstream meta(g_ray_results_texture_readback_path.string() + ".txt");
+    meta << "format: R8G8B8A8_UNORM\n";
+    meta << "width: " << width << "\n";
+    meta << "height: " << height << "\n";
+    meta << "stride_bytes: 4\n";
+    meta << "row_pitch_in_file: " << tight_pitch << "\n";
+    meta << "d3d12_readback_row_pitch: " << src_pitch << "\n";
+    meta << "bytes: " << (tight_pitch * height) << "\n";
+    meta << "index: pixel_index = x + y * width\n";
+
+    g_ray_results_texture_readback_pending = false;
+    g_app_state.SetStatus("DispatchRays texture output dumped to " + g_ray_results_texture_readback_path.string());
 }
 
 void UpdateDispatchRayGpuBuffers()
@@ -826,6 +999,9 @@ void RecreateRenderTargetSizedResources()
 
     ReleaseResource(&g_rt_output_resource);
     ReleaseResource(&g_cpu_rt_upload);
+    ReleaseResource(&g_ray_results_texture_readback_buffer);
+    g_ray_results_texture_readback_size = 0;
+    g_ray_results_texture_readback_pending = false;
     ReleaseResource(&g_hitpos_ao);
     ReleaseResource(&g_hitpos_ao_readback);
     ReleaseResource(&g_ray_mapping_upload);
@@ -1154,9 +1330,94 @@ const SceneDispatchRays* CurrentRraDispatch()
     return &g_scene_data.dispatches[g_selected_dispatch_index];
 }
 
+bool IsSingleRowDispatch(const SceneDispatchRays* dispatch)
+{
+    return dispatch != nullptr && dispatch->dispatch_dims.y == 1;
+}
+
+void ApplyDispatchViewportPolicy(const SceneDispatchRays* dispatch)
+{
+    if (!IsSingleRowDispatch(dispatch))
+    {
+        if (dispatch != nullptr)
+        {
+            ApplyRenderTargetSize(static_cast<int>(dispatch->dispatch_dims.x),
+                                  static_cast<int>(dispatch->dispatch_dims.y * std::max(1u, dispatch->dispatch_dims.z)));
+        }
+        return;
+    }
+
+    const bool mapping_settings_changed =
+        g_dispatch_ray_layout_mode != static_cast<int>(DispatchRayLayoutMode::kReflowBlocks) ||
+        g_dispatch_reflow_block_w != 1 ||
+        g_dispatch_reflow_block_h != 1;
+    g_dispatch_ray_layout_mode = static_cast<int>(DispatchRayLayoutMode::kReflowBlocks);
+    g_dispatch_reflow_block_w = 1;
+    g_dispatch_reflow_block_h = 1;
+    g_dispatch_reflow_skip_empty = true;
+    ApplyRenderTargetSize(WIN_W, WIN_H);
+    if (mapping_settings_changed)
+    {
+        MarkDispatchRayMappingDirty();
+    }
+}
+
+int CurrentVisibleRayTypeIndex()
+{
+    if (g_use_ray_in_pix)
+    {
+        return g_selected_dispatch_index + 2;
+    }
+    return g_use_ao ? 1 : 0;
+}
+
+void ApplyRayTypeSelection(int ray_type_index)
+{
+    const int max_ray_type = static_cast<int>(g_scene_data.dispatches.size()) + 1;
+    if (ray_type_index >= 2 && g_scene_data.dispatches.empty())
+    {
+        ray_type_index = 0;
+    }
+    ray_type_index = std::clamp(ray_type_index, 0, std::max(1, max_ray_type));
+    const int previous_ray_type = CurrentVisibleRayTypeIndex();
+
+    g_selected_ray_type_index = ray_type_index;
+    if (ray_type_index == 0)
+    {
+        g_use_ray_in_pix = false;
+        g_use_ao = false;
+    }
+    else if (ray_type_index == 1)
+    {
+        g_use_ray_in_pix = false;
+        g_use_ao = true;
+        g_render_backend = RenderBackend::kDxr;
+    }
+    else
+    {
+        g_use_ray_in_pix = true;
+        g_use_ao = false;
+        g_selected_dispatch_index = ray_type_index - 2;
+    }
+
+    if (previous_ray_type != CurrentVisibleRayTypeIndex())
+    {
+        MarkDispatchRayMappingDirty();
+    }
+}
+
 void RebuildDisplayDispatchRays()
 {
     const SceneDispatchRays* dispatch = CurrentRraDispatch();
+    if (IsSingleRowDispatch(dispatch) &&
+        (g_dispatch_ray_layout_mode != static_cast<int>(DispatchRayLayoutMode::kReflowBlocks) ||
+         g_dispatch_reflow_block_w != 1 ||
+         g_dispatch_reflow_block_h != 1 ||
+         RT_W != WIN_W ||
+         RT_H != WIN_H))
+    {
+        ApplyDispatchViewportPolicy(dispatch);
+    }
 
     const std::vector<RayInPixDumpFileMinimal>* src_rays = nullptr;
     const std::vector<uint32_t>* src_offsets = nullptr;
@@ -1446,10 +1707,19 @@ void BuildCompactDispatchReplay()
         previous_offset = end;
     }
 
-    std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-        return std::tie(a.ray_index, a.sbt_record_offset, a.sbt_record_stride, a.miss_index, a.pixel_index) <
-               std::tie(b.ray_index, b.sbt_record_offset, b.sbt_record_stride, b.miss_index, b.pixel_index);
-    });
+    if (g_compact_sort_by_sbt_entry)
+    {
+        std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            return std::tie(a.ray_index, a.sbt_record_offset, a.sbt_record_stride, a.miss_index, a.pixel_index) <
+                   std::tie(b.ray_index, b.sbt_record_offset, b.sbt_record_stride, b.miss_index, b.pixel_index);
+        });
+    }
+    else
+    {
+        std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            return std::tie(a.ray_index, a.pixel_index) < std::tie(b.ray_index, b.pixel_index);
+        });
+    }
 
     g_compact_dispatch_replay.rays.reserve(entries.size());
     g_compact_dispatch_replay.pixel_indices.reserve(entries.size());
@@ -1729,9 +1999,10 @@ void DumpCurrentDispatchRays(bool hex_text)
     }
 
     const std::string base_name = CurrentDumpBaseName();
+    const int ray_type_index = CurrentVisibleRayTypeIndex();
     const std::string mode_name = g_use_gpu_compact_dispatch_rays ? "compact" : "dispatch";
-    const std::filesystem::path out_dir = std::filesystem::path("output") / base_name / ("raytype" + std::to_string(g_selected_dispatch_index)) / mode_name;
-    const std::string prefix = base_name + "_raytype_" + std::to_string(g_selected_dispatch_index);
+    const std::filesystem::path out_dir = std::filesystem::path("output") / base_name / ("raytype" + std::to_string(ray_type_index)) / mode_name;
+    const std::string prefix = base_name + "_raytype_" + std::to_string(ray_type_index);
 
     if (!g_use_gpu_compact_dispatch_rays)
     {
@@ -2211,7 +2482,47 @@ void DrawImGuiPanel()
         ImGui::Text("Backend: %s", ToString(g_render_backend));
         ImGui::Text("CPU worker: %s", ToString(g_cpu_worker_stage.load()));
         ImGui::Text("CPU tiles done: %u / %u", g_cpu_display_tiles_completed, g_cpu_display_tiles_total);
-        ImGui::Text("Mode: %s", g_use_ao ? "AO rays" : "Primary rays");
+        g_selected_ray_type_index = CurrentVisibleRayTypeIndex();
+        std::vector<std::string> ray_type_names;
+        ray_type_names.push_back("raytype[0] Primary rays");
+        ray_type_names.push_back("raytype[1] AO rays");
+        for (size_t dispatch_index = 0; dispatch_index < g_scene_data.dispatches.size(); dispatch_index++)
+        {
+            ray_type_names.push_back("raytype[" + std::to_string(dispatch_index + 2) + "] " + g_scene_data.dispatches[dispatch_index].name);
+        }
+        if (g_selected_ray_type_index >= static_cast<int>(ray_type_names.size()))
+        {
+            ApplyRayTypeSelection(0);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Ray type: %s", ray_type_names[g_selected_ray_type_index].c_str());
+        const float ray_type_list_height =
+            ImGui::GetTextLineHeightWithSpacing() * static_cast<float>(std::min<int>(6, static_cast<int>(ray_type_names.size()))) +
+            ImGui::GetStyle().FramePadding.y * 2.0f;
+
+        if (ImGui::BeginListBox("##RAYTYPERay type", ImVec2(-5.0f, ray_type_list_height)))
+        {
+            for (int ray_type_index = 0; ray_type_index < static_cast<int>(ray_type_names.size()); ray_type_index++)
+            {
+                const bool selected = ray_type_index == g_selected_ray_type_index;
+                if (ImGui::Selectable(ray_type_names[ray_type_index].c_str(), selected))
+                {
+                    ApplyRayTypeSelection(ray_type_index);
+                    const SceneDispatchRays* dispatch = CurrentRraDispatch();
+                    if (ray_type_index >= 2 && dispatch != nullptr)
+                    {
+                        ApplyDispatchViewportPolicy(dispatch);
+                    }
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndListBox();
+        }
+
         int backend = static_cast<int>(g_render_backend);
         if (ImGui::Combo("Render path", &backend, "DXR\0CPU brute force\0CPU BVH\0"))
         {
@@ -2234,6 +2545,7 @@ void DrawImGuiPanel()
             if (g_render_backend != RenderBackend::kDxr)
             {
                 g_use_ao = false;
+                g_selected_ray_type_index = CurrentVisibleRayTypeIndex();
             }
         }
         if (g_render_backend != RenderBackend::kDxr)
@@ -2310,10 +2622,6 @@ void DrawImGuiPanel()
             }
         }
         ImGui::Separator();
-        if (ImGui::Checkbox("Use dispatch rays", &g_use_ray_in_pix))
-        {
-            MarkDispatchRayMappingDirty();
-        }
         const bool has_rra_dispatches = !g_scene_data.dispatches.empty();
         if (g_use_ray_in_pix)
         {
@@ -2323,27 +2631,10 @@ void DrawImGuiPanel()
             }
             if (has_rra_dispatches)
             {
-                std::vector<const char*> dispatch_names;
-                dispatch_names.reserve(g_scene_data.dispatches.size());
-                for (const auto& dispatch : g_scene_data.dispatches)
-                {
-                    dispatch_names.push_back(dispatch.name.c_str());
-                }
-                if (ImGui::Combo("RRA dispatch", &g_selected_dispatch_index, dispatch_names.data(), static_cast<int>(dispatch_names.size())))
-                {
-                    const SceneDispatchRays* dispatch = CurrentRraDispatch();
-                    if (dispatch != nullptr)
-                    {
-                        ApplyRenderTargetSize(static_cast<int>(dispatch->dispatch_dims.x),
-                                              static_cast<int>(dispatch->dispatch_dims.y * std::max(1u, dispatch->dispatch_dims.z)));
-                    }
-                    MarkDispatchRayMappingDirty();
-                }
                 const SceneDispatchRays* dispatch = CurrentRraDispatch();
                 if (dispatch != nullptr && ImGui::Button("RT = dispatch"))
                 {
-                    ApplyRenderTargetSize(static_cast<int>(dispatch->dispatch_dims.x),
-                                          static_cast<int>(dispatch->dispatch_dims.y * std::max(1u, dispatch->dispatch_dims.z)));
+                    ApplyDispatchViewportPolicy(dispatch);
                 }
             }
             else
@@ -2356,36 +2647,29 @@ void DrawImGuiPanel()
             {
                 MarkDispatchRayMappingDirty();
             }
-            static int reflow_block_w{8}, reflow_block_h{8};
-            static bool reflow_skip_empty{false};
             if (static_cast<DispatchRayLayoutMode>(g_dispatch_ray_layout_mode) == DispatchRayLayoutMode::kReflowBlocks)
             {
                 ImGui::Text("Reflow block ");
                 ImGui::SameLine();
                 ImGui::PushItemWidth(80);
-                if (ImGui::InputInt("##ReflowBlockW", &reflow_block_w, 1, 8))
+                if (ImGui::InputInt("##ReflowBlockW", &g_dispatch_reflow_block_w, 1, 8))
                 {
-                    reflow_block_w               = std::max(1, reflow_block_w);
+                    g_dispatch_reflow_block_w = std::max(1, g_dispatch_reflow_block_w);
+                    MarkDispatchRayMappingDirty();
                 }
                 ImGui::PopItemWidth();
                 ImGui::SameLine();
                 ImGui::Text("x");
                 ImGui::SameLine();
                 ImGui::PushItemWidth(80);
-                if (ImGui::InputInt("##ReflowBlockH", &reflow_block_h, 1, 8))
+                if (ImGui::InputInt("##ReflowBlockH", &g_dispatch_reflow_block_h, 1, 8))
                 {
-                    reflow_block_h               = std::max(1, reflow_block_h);
+                    g_dispatch_reflow_block_h = std::max(1, g_dispatch_reflow_block_h);
+                    MarkDispatchRayMappingDirty();
                 }
                 ImGui::PopItemWidth();
-                if (ImGui::Checkbox("Skip empty blocks", &reflow_skip_empty))
+                if (ImGui::Checkbox("Skip empty blocks", &g_dispatch_reflow_skip_empty))
                 {
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Apply"))
-                {
-                    g_dispatch_reflow_block_w    = reflow_block_w;
-                    g_dispatch_reflow_block_h    = reflow_block_h;
-                    g_dispatch_reflow_skip_empty = reflow_skip_empty;
                     MarkDispatchRayMappingDirty();
                 }
             }
@@ -2402,15 +2686,27 @@ void DrawImGuiPanel()
             ImGui::Text("GPU max rays/pixel: %u", g_gpu_dispatch_ray_max_rays_per_pixel);
             if (g_use_gpu_compact_dispatch_rays)
             {
+                if (ImGui::Checkbox("Sort compact rays by SBT entry", &g_compact_sort_by_sbt_entry))
+                {
+                    g_compact_dispatch_replay_dirty = true;
+                }
                 ImGui::Checkbox("Barrier between compact batches", &g_compact_dispatch_batch_barrier);
                 ImGui::Text("Compact batches: %zu", g_compact_dispatch_replay.batch_offsets.empty() ? 0 : g_compact_dispatch_replay.batch_offsets.size() - 1);
                 ImGui::Text("Compact rays: %zu", g_compact_dispatch_replay.rays.size());
                 ImGui::Text("Compact pixel ranges: %zu", g_compact_dispatch_replay.batch_pixel_ranges.size());
                 ImGui::Text("Compact pixel ray indices: %zu", g_compact_dispatch_replay.pixel_compact_indices.size());
-                if (ImGui::Button("Dump compact ray results"))
+            }
+            if (ImGui::Button("Dump ray results"))
+            {
+                if (g_use_gpu_compact_dispatch_rays)
                 {
-                    g_dump_compact_ray_results_requested = true;
+                    g_dump_ray_results_requested = true;
                     g_app_state.SetStatus("Compact DispatchRays output dump requested.");
+                }
+                else
+                {
+                    g_dump_ray_results_requested = true;
+                    g_app_state.SetStatus("DispatchRays output dump requested.");
                 }
             }
             if (ImGui::Button("Dump rays binary"))
@@ -2617,12 +2913,12 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         case GLFW_KEY_1:
         {
             g_render_backend = RenderBackend::kDxr;
-            g_use_ao = true;
+            ApplyRayTypeSelection(1);
             break;
         }
         case GLFW_KEY_0: {
             g_render_backend = RenderBackend::kDxr;
-            g_use_ao = false;
+            ApplyRayTypeSelection(0);
             break;
         }
         case GLFW_KEY_4:
@@ -2635,7 +2931,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
                 g_app_state.SetCpuRenderStats({});
             }
             g_render_backend = RenderBackend::kCpuBruteForce;
-            g_use_ao         = false;
+            ApplyRayTypeSelection(g_use_ray_in_pix ? CurrentVisibleRayTypeIndex() : 0);
             break;
         }
         case GLFW_KEY_5:
@@ -2648,7 +2944,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
                 g_app_state.SetCpuRenderStats({});
             }
             g_render_backend = RenderBackend::kCpuBvh;
-            g_use_ao         = false;
+            ApplyRayTypeSelection(g_use_ray_in_pix ? CurrentVisibleRayTypeIndex() : 0);
             break;
         }
         case GLFW_KEY_UP:
@@ -2672,7 +2968,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
                 g_render_backend = RenderBackend::kDxr;
                 g_benchmarkState = BenchmarkState::BENCHMARKING;
                 g_ao_sample_count = 0;
-                g_use_ao          = true;
+                ApplyRayTypeSelection(1);
                 g_bmk_ft_count    = 0;
                 g_bmk_frametimes.clear();
             }
@@ -2701,13 +2997,12 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             }
             break;
         }
-        case GLFW_KEY_P:
-        {
-            g_use_ray_in_pix = !g_use_ray_in_pix;
-            g_dispatch_ray_mapping_dirty = true;
-            printf("g_use_ray_in_pix = %d\n", g_use_ray_in_pix);
-            break;
-        }
+        //case GLFW_KEY_P:
+        //{
+        //    ApplyRayTypeSelection(g_use_ray_in_pix ? 0 : 2);
+        //    printf("g_use_ray_in_pix = %d\n", g_use_ray_in_pix);
+        //    break;
+        //}
         default:
             break;
         }
@@ -2731,6 +3026,15 @@ void OnSwapchainSizeChanged()
         CE(g_swapchain->GetBuffer(i, IID_PPV_ARGS(&g_rendertargets[i])));
         g_device12->CreateRenderTargetView(g_rendertargets[i], nullptr, rtv_handle);
         rtv_handle.ptr += g_rtv_descriptor_size;
+    }
+
+    if (g_use_ray_in_pix)
+    {
+        const SceneDispatchRays* dispatch = CurrentRraDispatch();
+        if (IsSingleRowDispatch(dispatch))
+        {
+            ApplyDispatchViewportPolicy(dispatch);
+        }
     }
 }
 
@@ -3819,7 +4123,7 @@ void Render()
                     }
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
                     const bool dump_compact_ray_results_this_frame =
-                        g_dump_compact_ray_results_requested && g_compact_ray_results_buffer != nullptr && !g_compact_dispatch_replay.rays.empty();
+                        g_dump_ray_results_requested && g_compact_ray_results_buffer != nullptr && !g_compact_dispatch_replay.rays.empty();
                     if (dump_compact_ray_results_this_frame)
                     {
                         const uint64_t dump_size = static_cast<uint64_t>(g_compact_dispatch_replay.rays.size()) * sizeof(float) * 4;
@@ -3838,15 +4142,16 @@ void Render()
                             g_command_list->ResourceBarrier(1, &copy_barrier);
 
                             const std::string base_name = CurrentDumpBaseName();
-                            g_compact_ray_results_readback_path = std::filesystem::path("output") /
+                            const int ray_type_index = CurrentVisibleRayTypeIndex();
+                            g_ray_results_readback_path = std::filesystem::path("output") /
                                                                   base_name /
-                                                                  ("raytype" + std::to_string(g_selected_dispatch_index)) /
+                                                                  ("raytype" + std::to_string(ray_type_index)) /
                                                                   "compact" /
                                                                   "CompactRayResults.bin";
-                            g_compact_ray_results_readback_count = static_cast<uint32_t>(g_compact_dispatch_replay.rays.size());
-                            g_compact_ray_results_readback_pending = true;
+                            g_ray_results_readback_count = static_cast<uint32_t>(g_compact_dispatch_replay.rays.size());
+                            g_ray_results_readback_pending = true;
                         }
-                        g_dump_compact_ray_results_requested = false;
+                        g_dump_ray_results_requested = false;
                     }
                     else
                     {
@@ -3902,6 +4207,42 @@ void Render()
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
                     g_command_list->DispatchRays(&desc);
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+
+                    const bool dump_ray_results_this_frame = g_dump_ray_results_requested;
+                    if (dump_ray_results_this_frame)
+                    {
+                        if (EnsureRayResultsTextureReadbackBuffer())
+                        {
+                            D3D12_RESOURCE_BARRIER copy_barrier = barrier_rt_out;
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+
+                            D3D12_TEXTURE_COPY_LOCATION dst{};
+                            dst.pResource        = g_ray_results_texture_readback_buffer;
+                            dst.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            dst.PlacedFootprint  = g_ray_results_texture_readback_footprint;
+
+                            D3D12_TEXTURE_COPY_LOCATION src{};
+                            src.pResource        = g_rt_output_resource;
+                            src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            src.SubresourceIndex = 0;
+                            g_command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+
+                            const std::string base_name      = CurrentDumpBaseName();
+                            const int         ray_type_index = CurrentVisibleRayTypeIndex();
+                            g_ray_results_texture_readback_path = std::filesystem::path("output") / base_name / ("raytype" + std::to_string(ray_type_index)) /
+                                                                  "dispatch" / "RayResultsRGBA8.bin";
+                            g_ray_results_texture_readback_width = static_cast<uint32_t>(RT_W);
+                            g_ray_results_texture_readback_height = static_cast<uint32_t>(RT_H);
+                            g_ray_results_texture_readback_pending = true;
+                        }
+                        g_dump_ray_results_requested = false;
+                    }
                 }
             }
             else
@@ -4087,6 +4428,7 @@ void Render()
         }
     }
     WritePendingCompactRayResultsDump();
+    WritePendingRayResultsTextureDump();
     if (g_frame_time.ShouldUpdate())
     {
         std::stringstream ss;
@@ -4540,6 +4882,7 @@ void LoadSceneAndCreateAS(bool rra_file_exists)
 
     g_scene_aabb_min = scene.stats.scene_aabb_min;
     g_scene_aabb_max = scene.stats.scene_aabb_max;
+    g_selected_ray_type_index = 0;
     g_selected_dispatch_index = 0;
     g_dispatch_ray_mapping_dirty = true;
     g_dispatch_ray_gpu_dirty = true;
