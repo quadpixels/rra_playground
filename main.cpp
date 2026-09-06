@@ -539,17 +539,21 @@ void CreateStructuredBufferSrv(ID3D12Resource** resource,
     ReleaseResource(resource);
 
     const uint32_t safe_element_count = std::max(1u, element_count);
-    D3D12_HEAP_PROPERTIES props{};
-    props.Type                 = D3D12_HEAP_TYPE_UPLOAD;
-    props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    props.CreationNodeMask     = 1;
-    props.VisibleNodeMask      = 1;
+    const uint64_t buffer_size = static_cast<UINT64>(safe_element_count) * element_size;
+    D3D12_HEAP_PROPERTIES default_props{};
+    default_props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    default_props.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    default_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    default_props.CreationNodeMask     = 1;
+    default_props.VisibleNodeMask      = 1;
+
+    D3D12_HEAP_PROPERTIES upload_props = default_props;
+    upload_props.Type = D3D12_HEAP_TYPE_UPLOAD;
 
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Alignment          = 0;
-    desc.Width              = static_cast<UINT64>(safe_element_count) * element_size;
+    desc.Width              = buffer_size;
     desc.Height             = 1;
     desc.DepthOrArraySize   = 1;
     desc.MipLevels          = 1;
@@ -559,19 +563,45 @@ void CreateStructuredBufferSrv(ID3D12Resource** resource,
     desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
     CE(g_device12->CreateCommittedResource(
-        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(resource)));
+        &default_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(resource)));
+
+    ID3D12Resource* upload_resource = nullptr;
+    CE(g_device12->CreateCommittedResource(
+        &upload_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload_resource)));
 
     void* mapped = nullptr;
-    (*resource)->Map(0, nullptr, &mapped);
+    upload_resource->Map(0, nullptr, &mapped);
     if (data != nullptr && element_count > 0)
     {
         memcpy(mapped, data, static_cast<size_t>(element_count) * element_size);
+        if (safe_element_count > element_count)
+        {
+            memset(reinterpret_cast<uint8_t*>(mapped) + static_cast<size_t>(element_count) * element_size,
+                   0,
+                   static_cast<size_t>(safe_element_count - element_count) * element_size);
+        }
     }
     else
     {
         memset(mapped, 0, static_cast<size_t>(safe_element_count) * element_size);
     }
-    (*resource)->Unmap(0, nullptr);
+    upload_resource->Unmap(0, nullptr);
+
+    CE(g_command_allocator->Reset());
+    CE(g_command_list->Reset(g_command_allocator, nullptr));
+    g_command_list->CopyBufferRegion(*resource, 0, upload_resource, 0, buffer_size);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource   = *resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
+    g_command_list->ResourceBarrier(1, &barrier);
+    CE(g_command_list->Close());
+    g_command_queue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList* const*>(&g_command_list));
+    WaitForPreviousFrame();
+    CE(g_command_allocator->Reset());
+    upload_resource->Release();
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Buffer.FirstElement        = 0;
