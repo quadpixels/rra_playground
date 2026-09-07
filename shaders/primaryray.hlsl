@@ -181,7 +181,7 @@ void RayGen()
 void Miss(inout HitInfo payload : SV_RayPayload)
 {
     float2 uv = DispatchRaysIndex().xy * 1.0 / DispatchRaysDimensions().xy;
-    if ((load_ray_from_buffer & 4) != 0)
+    if (load_ray_from_buffer != 0)
     {
         const uint pixel_x = payload.pixel_index % rt_w;
         const uint pixel_y = payload.pixel_index / rt_w;
