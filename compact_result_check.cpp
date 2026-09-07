@@ -47,7 +47,7 @@ int main(int argc, char** argv)
         {
             should_print_per_batch = true;
             printf("Should print per patch.\n");
-        }
+        } 
         else if ((!strcmp(argv[i], "-file-to-use")) && i+1 < argc)
         {
             FILE_TO_USE = std::atoi(argv[i + 1]);

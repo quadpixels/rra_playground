@@ -29,6 +29,75 @@ void RayGen()
     bool should_skip = false;
     RayDesc ray;
 
+    if ((load_ray_from_buffer & 8) != 0)
+    {
+        const uint work_count = compact_batch_base;
+        while (true)
+        {
+            uint work_index = 0;
+            InterlockedAdd(CompactAccumCount[rt_w * rt_h], 1, work_index);
+            if (work_index >= work_count)
+            {
+                return;
+            }
+
+            const uint pixel = CompactPixelRayIndices[work_index];
+            const uint rayidx_lb = pixel == 0 ? 0 : RayEntryOffsets[pixel - 1];
+            const uint rayidx_ub = RayEntryOffsets[pixel];
+            const uint nr = rayidx_ub - rayidx_lb;
+            if (nr == 0)
+            {
+                continue;
+            }
+
+            float4 sum = float4(0, 0, 0, 0);
+            for (uint rayidx = rayidx_lb; rayidx < rayidx_ub; rayidx++)
+            {
+                RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[rayidx];
+                ray.Origin = rpbm.origin;
+                ray.Direction = rpbm.direction;
+                ray.TMin = rpbm.tmin;
+                ray.TMax = rpbm.tmax;
+
+                HitInfo payload = { float4(0, 0, 0, 1), 0, pixel };
+                TraceRay(Scene,
+                    rpbm.ray_flags,
+                    rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
+                sum += payload.colorAndDistance;
+            }
+
+            const uint x = pixel % rt_w;
+            const uint y = pixel / rt_w;
+            RenderTarget[uint2(x, y)] = sum / float(nr);
+        }
+    }
+
+    if ((load_ray_from_buffer & 16) != 0)
+    {
+        const uint work_count = compact_batch_base;
+        while (true)
+        {
+            uint compact_id = 0;
+            InterlockedAdd(CompactAccumCount[rt_w * rt_h], 1, compact_id);
+            if (compact_id >= work_count)
+            {
+                return;
+            }
+
+            RayInPixBufferMinimal rpbm = RaysInPixBufferMinimal[compact_id];
+            ray.Origin = rpbm.origin;
+            ray.Direction = rpbm.direction;
+            ray.TMin = rpbm.tmin;
+            ray.TMax = rpbm.tmax;
+
+            HitInfo payload = { float4(0, 0, 0, 1), 0, rpbm.original_pixel_index };
+            TraceRay(Scene,
+                rpbm.ray_flags,
+                rpbm.instance_inclusion_mask & 0xFF, 0, 0, 0, ray, payload);
+            CompactRayResults[compact_id] = payload.colorAndDistance;
+        }
+    }
+
     if ((load_ray_from_buffer & 4) != 0)
     {
         const uint compact_id = compact_batch_base + DispatchRaysIndex().x;

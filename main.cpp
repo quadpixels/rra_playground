@@ -56,6 +56,14 @@ enum class DispatchRayLayoutMode
     kReflowBlocks = 1,
 };
 
+enum class GpuDispatchReplayMode
+{
+    kDirect = 0,
+    kWavefront = 1,
+    kPersistentWarp = 2,
+    kPersistentWavefront = 3,
+};
+
 struct GpuRayInPix
 {
     float    origin[3]{};
@@ -91,8 +99,11 @@ bool                                 g_dispatch_ray_mapping_dirty{true};
 bool                                 g_dispatch_ray_gpu_dirty{true};
 bool                                 g_use_ray_in_pix{false};
 bool                                 g_use_gpu_compact_dispatch_rays{false};
+int                                  g_gpu_dispatch_replay_mode{0};
 bool                                 g_compact_sort_by_sbt_entry{true};
 bool                                 g_compact_dispatch_batch_barrier{false};
+int                                  g_persistent_work_group_size_index{1};
+int                                  g_persistent_work_group_count_index{1};
 bool                                 g_dump_ray_results_requested{false};
 bool                                 g_ray_results_readback_pending{false};
 uint32_t                             g_ray_results_readback_count{0};
@@ -111,6 +122,7 @@ struct CompactDispatchReplayData
 
     std::vector<RayInPixDumpFileMinimal> rays;
     std::vector<uint32_t>                pixel_indices;
+    std::vector<uint32_t>                active_pixel_indices;
     std::vector<uint32_t>                batch_offsets;
     std::vector<BatchPixelRange>         batch_pixel_ranges;
     std::vector<uint32_t>                batch_pixel_range_offsets;
@@ -499,6 +511,49 @@ void MarkDispatchRayMappingDirty()
     g_compact_dispatch_replay_dirty = true;
 }
 
+GpuDispatchReplayMode CurrentGpuDispatchReplayMode()
+{
+    return static_cast<GpuDispatchReplayMode>(g_gpu_dispatch_replay_mode);
+}
+
+bool UsesWavefrontData(GpuDispatchReplayMode mode)
+{
+    return mode == GpuDispatchReplayMode::kWavefront ||
+           mode == GpuDispatchReplayMode::kPersistentWarp ||
+           mode == GpuDispatchReplayMode::kPersistentWavefront;
+}
+
+bool UsesRayResultBuffer(GpuDispatchReplayMode mode)
+{
+    return mode == GpuDispatchReplayMode::kWavefront ||
+           mode == GpuDispatchReplayMode::kPersistentWavefront;
+}
+
+bool UsesReducePass(GpuDispatchReplayMode mode)
+{
+    return mode == GpuDispatchReplayMode::kWavefront ||
+           mode == GpuDispatchReplayMode::kPersistentWavefront;
+}
+
+uint32_t PersistentWorkGroupSize()
+{
+    static const uint32_t kSizes[] = {64, 128, 256};
+    g_persistent_work_group_size_index = std::clamp(g_persistent_work_group_size_index, 0, static_cast<int>(_countof(kSizes)) - 1);
+    return kSizes[g_persistent_work_group_size_index];
+}
+
+uint32_t PersistentWorkGroupCount()
+{
+    static const uint32_t kCounts[] = {128, 256, 512, 1024};
+    g_persistent_work_group_count_index = std::clamp(g_persistent_work_group_count_index, 0, static_cast<int>(_countof(kCounts)) - 1);
+    return kCounts[g_persistent_work_group_count_index];
+}
+
+void SyncLegacyCompactFlag()
+{
+    g_use_gpu_compact_dispatch_rays = UsesWavefrontData(CurrentGpuDispatchReplayMode());
+}
+
 void ApplyStablePowerState(bool enabled)
 {
     if (g_device12 == nullptr)
@@ -811,7 +866,7 @@ void WritePendingCompactRayResultsDump()
     meta << "rendertarget size: " << RT_W << " x " << RT_H << "\n";
 
     g_ray_results_readback_pending = false;
-    g_app_state.SetStatus("Compact DispatchRays output dumped to " + g_ray_results_readback_path.string());
+    g_app_state.SetStatus("Wavefront DispatchRays output dumped to " + g_ray_results_readback_path.string());
 }
 
 bool EnsureRayResultsTextureReadbackBuffer()
@@ -965,6 +1020,18 @@ void UpdateDispatchRayGpuBuffers()
                               sizeof(uint32_t),
                               static_cast<uint32_t>(g_gpu_dispatch_ray_offsets.size()),
                               9);
+    CompactDispatchReplayData::BatchPixelRange dummy_pixel_range{};
+    uint32_t dummy_pixel_index = 0;
+    CreateStructuredBufferSrv(&g_compact_batch_pixel_offsets_buffer,
+                              &dummy_pixel_range,
+                              sizeof(CompactDispatchReplayData::BatchPixelRange),
+                              1,
+                              13);
+    CreateStructuredBufferSrv(&g_compact_pixel_compact_indices_buffer,
+                              &dummy_pixel_index,
+                              sizeof(uint32_t),
+                              1,
+                              14);
     g_dispatch_ray_gpu_dirty = false;
 }
 
@@ -979,22 +1046,36 @@ void UpdateCompactDispatchReplayGpuBuffers()
         BuildCompactDispatchReplay();
     }
 
-    std::vector<GpuRayInPix> upload_rays = BuildGpuRayUploadBuffer(g_compact_dispatch_replay.rays,
-                                                                   &g_compact_dispatch_replay.pixel_indices);
+    const GpuDispatchReplayMode replay_mode = CurrentGpuDispatchReplayMode();
+    const bool persistent_warp = replay_mode == GpuDispatchReplayMode::kPersistentWarp;
+    std::vector<GpuRayInPix> upload_rays = persistent_warp
+        ? BuildGpuRayUploadBuffer(g_display_ray_buffer)
+        : BuildGpuRayUploadBuffer(g_compact_dispatch_replay.rays, &g_compact_dispatch_replay.pixel_indices);
     CreateStructuredBufferSrv(&g_rays_in_pix_buffer,
                               upload_rays.empty() ? nullptr : upload_rays.data(),
                               sizeof(GpuRayInPix),
                               static_cast<uint32_t>(upload_rays.size()),
                               8);
+    if (persistent_warp)
+    {
+        CreateStructuredBufferSrv(&g_ray_entry_offsets_buffer,
+                                  g_display_ray_offsets.empty() ? nullptr : g_display_ray_offsets.data(),
+                                  sizeof(uint32_t),
+                                  static_cast<uint32_t>(g_display_ray_offsets.size()),
+                                  9);
+    }
     CreateStructuredBufferSrv(&g_compact_batch_pixel_offsets_buffer,
                               g_compact_dispatch_replay.batch_pixel_ranges.empty() ? nullptr : g_compact_dispatch_replay.batch_pixel_ranges.data(),
                               sizeof(CompactDispatchReplayData::BatchPixelRange),
                               static_cast<uint32_t>(g_compact_dispatch_replay.batch_pixel_ranges.size()),
                               13);
+    const std::vector<uint32_t>& compact_pixel_indices_srv = persistent_warp
+        ? g_compact_dispatch_replay.active_pixel_indices
+        : g_compact_dispatch_replay.pixel_compact_indices;
     CreateStructuredBufferSrv(&g_compact_pixel_compact_indices_buffer,
-                              g_compact_dispatch_replay.pixel_compact_indices.empty() ? nullptr : g_compact_dispatch_replay.pixel_compact_indices.data(),
+                              compact_pixel_indices_srv.empty() ? nullptr : compact_pixel_indices_srv.data(),
                               sizeof(uint32_t),
-                              static_cast<uint32_t>(g_compact_dispatch_replay.pixel_compact_indices.size()),
+                              static_cast<uint32_t>(compact_pixel_indices_srv.size()),
                               14);
     CreateStructuredBufferUav(&g_compact_ray_results_buffer,
                               sizeof(float) * 4,
@@ -1006,7 +1087,7 @@ void UpdateCompactDispatchReplayGpuBuffers()
                               11);
     CreateStructuredBufferUav(&g_compact_accum_count_buffer,
                               sizeof(uint32_t),
-                              static_cast<uint32_t>(RT_W * RT_H),
+                              static_cast<uint32_t>(RT_W * RT_H + 1),
                               12);
     g_dispatch_ray_gpu_dirty = false;
 }
@@ -1150,7 +1231,7 @@ void RecreateRenderTargetSizedResources()
 
     CreateStructuredBufferUav(&g_compact_ray_results_buffer, sizeof(float) * 4, 1, 10);
     CreateStructuredBufferUav(&g_compact_accum_color_buffer, sizeof(float) * 4, 1, 11);
-    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 1, 12);
+    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 2, 12);
 
     MarkDispatchRayMappingDirty();
     g_ray_mapping_dirty = true;
@@ -1754,6 +1835,19 @@ void BuildCompactDispatchReplay()
     g_compact_dispatch_replay.rays.reserve(entries.size());
     g_compact_dispatch_replay.pixel_indices.reserve(entries.size());
     g_compact_dispatch_replay.batch_offsets.push_back(0);
+    g_compact_dispatch_replay.active_pixel_indices.reserve(g_display_ray_offsets.size());
+    {
+        uint32_t previous_offset = 0;
+        for (uint32_t pixel = 0; pixel < g_display_ray_offsets.size(); pixel++)
+        {
+            const uint32_t end = std::min<uint32_t>(g_display_ray_offsets[pixel], static_cast<uint32_t>(g_display_ray_buffer.size()));
+            if (end > previous_offset)
+            {
+                g_compact_dispatch_replay.active_pixel_indices.push_back(pixel);
+            }
+            previous_offset = end;
+        }
+    }
 
     uint32_t current_ray_index = entries.empty() ? 0 : entries.front().ray_index;
     for (const Entry& entry : entries)
@@ -2023,18 +2117,18 @@ void DumpCurrentDispatchRays(bool hex_text)
     {
         RebuildGpuDispatchRays();
     }
-    if (g_use_gpu_compact_dispatch_rays && g_compact_dispatch_replay_dirty)
+    if (UsesWavefrontData(CurrentGpuDispatchReplayMode()) && g_compact_dispatch_replay_dirty)
     {
         BuildCompactDispatchReplay();
     }
 
     const std::string base_name = CurrentDumpBaseName();
     const int ray_type_index = CurrentVisibleRayTypeIndex();
-    const std::string mode_name = g_use_gpu_compact_dispatch_rays ? "compact" : "dispatch";
+    const std::string mode_name = UsesWavefrontData(CurrentGpuDispatchReplayMode()) ? "wavefront" : "dispatch";
     const std::filesystem::path out_dir = std::filesystem::path("output") / base_name / ("raytype" + std::to_string(ray_type_index)) / mode_name;
     const std::string prefix = base_name + "_raytype_" + std::to_string(ray_type_index);
 
-    if (!g_use_gpu_compact_dispatch_rays)
+    if (!UsesWavefrontData(CurrentGpuDispatchReplayMode()))
     {
         WriteRayDumpFiles(out_dir, prefix, g_gpu_dispatch_ray_buffer, g_gpu_dispatch_ray_offsets, hex_text);
         g_app_state.SetStatus(std::string(hex_text ? "Hex" : "Binary") + " dispatch ray dump written to " + out_dir.string());
@@ -2068,7 +2162,7 @@ void DumpCurrentDispatchRays(bool hex_text)
         WriteCompactIndexDump(batch_dir, batch, batch_begin, batch_end, hex_text);
     }
 
-    g_app_state.SetStatus(std::string(hex_text ? "Hex" : "Binary") + " compact ray dump written to " + out_dir.string());
+    g_app_state.SetStatus(std::string(hex_text ? "Hex" : "Binary") + " wavefront ray dump written to " + out_dir.string());
 }
 
 std::vector<CpuRay> BuildCpuExternalRays()
@@ -2442,13 +2536,13 @@ void DrawImGuiPanel()
     {
 
         auto check_hover_times = [&]() {
-            bool is_compact = (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays);
+            bool is_compact = (g_use_ray_in_pix && UsesWavefrontData(CurrentGpuDispatchReplayMode()));
             if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
                 if (is_compact)
                 {
-                    ImGui::Text("Click to copy frametime, dispatch_rays_time, scatter_time to clipboard");
+                    ImGui::Text("Click to copy frametime, dispatch_rays_time, scatter_time, reduce_time to clipboard");
                 }
                 else
                 {
@@ -2460,16 +2554,16 @@ void DrawImGuiPanel()
                     char buf[200];
                     if (is_compact)
                     {
-                        snprintf(buf, sizeof(buf), "%g", g_app_state.last_gpu_frame_ms);
-                    }
-                    else
-                    {
                         snprintf(buf, sizeof(buf), "%g, %g, %g, %g", 
                           g_app_state.last_gpu_frame_ms, 
                           g_app_state.last_gpu_compact_dispatch_rays_ms, 
                           g_app_state.last_gpu_compact_scatter_ms,
                           g_app_state.last_gpu_compact_reduce_ms
                         );
+                    }
+                    else
+                    {
+                        snprintf(buf, sizeof(buf), "%g", g_app_state.last_gpu_frame_ms);
                     }
                     CopyToClipboard(std::string(buf));
                 }
@@ -2485,13 +2579,13 @@ void DrawImGuiPanel()
         }
         ImGui::Text("GPU frame:                %.3f ms", g_app_state.last_gpu_frame_ms);
         check_hover_times();
-        if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+        if (g_use_ray_in_pix && UsesWavefrontData(CurrentGpuDispatchReplayMode()))
         {
-            ImGui::Text("GPU compact DispatchRays: %.3f ms", g_app_state.last_gpu_compact_dispatch_rays_ms);
+            ImGui::Text("GPU replay DispatchRays:  %.3f ms", g_app_state.last_gpu_compact_dispatch_rays_ms);
             check_hover_times();
-            ImGui::Text("GPU compact Scatter     : %.3f ms", g_app_state.last_gpu_compact_scatter_ms);
+            ImGui::Text("GPU replay Scatter      : %.3f ms", g_app_state.last_gpu_compact_scatter_ms);
             check_hover_times();
-            ImGui::Text("GPU compact Reduce      : %.3f ms", g_app_state.last_gpu_compact_reduce_ms);
+            ImGui::Text("GPU replay Reduce       : %.3f ms", g_app_state.last_gpu_compact_reduce_ms);
             check_hover_times();
         }
         else
@@ -2655,8 +2749,10 @@ void DrawImGuiPanel()
         const bool has_rra_dispatches = !g_scene_data.dispatches.empty();
         if (g_use_ray_in_pix)
         {
-            if (ImGui::Checkbox("GPU compact replay", &g_use_gpu_compact_dispatch_rays))
+            static const char* kGpuReplayModeLabels[] = {"Direct", "Wavefront", "Persistent Warp", "Persistent Wavefront"};
+            if (ImGui::Combo("GPU replay mode", &g_gpu_dispatch_replay_mode, kGpuReplayModeLabels, IM_ARRAYSIZE(kGpuReplayModeLabels)))
             {
+                SyncLegacyCompactFlag();
                 MarkDispatchRayMappingDirty();
             }
             if (has_rra_dispatches)
@@ -2714,24 +2810,41 @@ void DrawImGuiPanel()
             ImGui::Text("GPU uploaded rays: %zu", g_gpu_dispatch_ray_buffer.size());
             ImGui::Text("GPU active pixels: %u", g_gpu_dispatch_ray_active_pixels);
             ImGui::Text("GPU max rays/pixel: %u", g_gpu_dispatch_ray_max_rays_per_pixel);
-            if (g_use_gpu_compact_dispatch_rays)
+            if (UsesWavefrontData(CurrentGpuDispatchReplayMode()))
             {
-                if (ImGui::Checkbox("Sort compact rays by SBT entry", &g_compact_sort_by_sbt_entry))
+                if (CurrentGpuDispatchReplayMode() == GpuDispatchReplayMode::kWavefront ||
+                    CurrentGpuDispatchReplayMode() == GpuDispatchReplayMode::kPersistentWavefront)
                 {
-                    g_compact_dispatch_replay_dirty = true;
+                    if (ImGui::Checkbox("Sort wavefront rays by SBT entry", &g_compact_sort_by_sbt_entry))
+                    {
+                        g_compact_dispatch_replay_dirty = true;
+                    }
                 }
-                ImGui::Checkbox("Barrier between compact batches", &g_compact_dispatch_batch_barrier);
-                ImGui::Text("Compact batches: %zu", g_compact_dispatch_replay.batch_offsets.empty() ? 0 : g_compact_dispatch_replay.batch_offsets.size() - 1);
-                ImGui::Text("Compact rays: %zu", g_compact_dispatch_replay.rays.size());
-                ImGui::Text("Compact pixel ranges: %zu", g_compact_dispatch_replay.batch_pixel_ranges.size());
-                ImGui::Text("Compact pixel ray indices: %zu", g_compact_dispatch_replay.pixel_compact_indices.size());
+                if (CurrentGpuDispatchReplayMode() == GpuDispatchReplayMode::kWavefront)
+                {
+                    ImGui::Checkbox("Barrier between wavefront batches", &g_compact_dispatch_batch_barrier);
+                }
+                if (CurrentGpuDispatchReplayMode() == GpuDispatchReplayMode::kPersistentWarp ||
+                    CurrentGpuDispatchReplayMode() == GpuDispatchReplayMode::kPersistentWavefront)
+                {
+                    static const char* kPersistentGroupSizes[] = {"64", "128", "256"};
+                    static const char* kPersistentGroupCounts[] = {"128", "256", "512", "1024"};
+                    ImGui::Combo("Persistent work group size", &g_persistent_work_group_size_index, kPersistentGroupSizes, IM_ARRAYSIZE(kPersistentGroupSizes));
+                    ImGui::Combo("Persistent work groups", &g_persistent_work_group_count_index, kPersistentGroupCounts, IM_ARRAYSIZE(kPersistentGroupCounts));
+                    ImGui::Text("Persistent workers: %u", PersistentWorkGroupSize() * PersistentWorkGroupCount());
+                }
+                ImGui::Text("Wavefront batches: %zu", g_compact_dispatch_replay.batch_offsets.empty() ? 0 : g_compact_dispatch_replay.batch_offsets.size() - 1);
+                ImGui::Text("Wavefront rays: %zu", g_compact_dispatch_replay.rays.size());
+                ImGui::Text("Wavefront active pixels: %zu", g_compact_dispatch_replay.active_pixel_indices.size());
+                ImGui::Text("Wavefront pixel ranges: %zu", g_compact_dispatch_replay.batch_pixel_ranges.size());
+                ImGui::Text("Wavefront pixel ray indices: %zu", g_compact_dispatch_replay.pixel_compact_indices.size());
             }
             if (ImGui::Button("Dump ray results"))
             {
-                if (g_use_gpu_compact_dispatch_rays)
+                if (UsesRayResultBuffer(CurrentGpuDispatchReplayMode()))
                 {
                     g_dump_ray_results_requested = true;
-                    g_app_state.SetStatus("Compact DispatchRays output dump requested.");
+                    g_app_state.SetStatus("Wavefront DispatchRays output dump requested.");
                 }
                 else
                 {
@@ -3354,7 +3467,7 @@ void InitDX12Stuff()
     UpdateDispatchRayGpuBuffers();
     CreateStructuredBufferUav(&g_compact_ray_results_buffer, sizeof(float) * 4, 1, 10);
     CreateStructuredBufferUav(&g_compact_accum_color_buffer, sizeof(float) * 4, 1, 11);
-    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 1, 12);
+    CreateStructuredBufferUav(&g_compact_accum_count_buffer, sizeof(uint32_t), 2, 12);
 
     // Root params for drawing the FSQUAD
     {
@@ -3530,11 +3643,12 @@ void CreateRTPipeline()
 {
     // 1. Root parameters (global)
     {
-        D3D12_ROOT_PARAMETER root_params[4]{};
+        D3D12_ROOT_PARAMETER root_params[5]{};
         root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         root_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         root_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 
         D3D12_DESCRIPTOR_RANGE desc_ranges[5]{};
         desc_ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // Output0
@@ -3589,15 +3703,25 @@ void CreateRTPipeline()
         root_params[3].DescriptorTable.pDescriptorRanges    = &compact_uav_range;
         root_params[3].DescriptorTable.NumDescriptorRanges  = 1;
         root_params[3].ShaderVisibility                     = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_DESCRIPTOR_RANGE compact_srv_range{};
+        compact_srv_range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        compact_srv_range.NumDescriptors                    = 2;
+        compact_srv_range.BaseShaderRegister                = 5;
+        compact_srv_range.RegisterSpace                     = 0;
+        compact_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        root_params[4].DescriptorTable.pDescriptorRanges    = &compact_srv_range;
+        root_params[4].DescriptorTable.NumDescriptorRanges  = 1;
+        root_params[4].ShaderVisibility                     = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootsig_desc{};
         rootsig_desc.NumStaticSamplers = 0;
         rootsig_desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        rootsig_desc.NumParameters     = 4;
+        rootsig_desc.NumParameters     = 5;
         rootsig_desc.pParameters       = root_params;
 
-        ID3DBlob *signature, *error;
-        D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+        ID3DBlob* signature = nullptr;
+        ID3DBlob* error = nullptr;
+        CE(D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
         if (error)
         {
             printf("Error: %s\n", (char*)(error->GetBufferPointer()));
@@ -3614,8 +3738,11 @@ void CreateRTPipeline()
         desc_ranges[4].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
         root_params[0].DescriptorTable.NumDescriptorRanges = 5;
+        rootsig_desc.NumParameters = 4;
 
-        D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+        signature = nullptr;
+        error = nullptr;
+        CE(D3D12SerializeRootSignature(&rootsig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
         if (error)
         {
             printf("Error: %s\n", (char*)(error->GetBufferPointer()));
@@ -3695,7 +3822,7 @@ void CreateRTPipeline()
         rtpso_desc.pSubobjects   = subobjects.data();
         CE(g_device12->CreateStateObject(&rtpso_desc, IID_PPV_ARGS(&g_rt_state_object)));
 
-        g_rt_state_object->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props));
+        CE(g_rt_state_object->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props)));
     }
 
     // RTPSO for AO rays
@@ -3787,7 +3914,7 @@ void CreateRTPipeline()
         rtpso_desc.pSubobjects   = subobjects.data();
         CE(g_device12->CreateStateObject(&rtpso_desc, IID_PPV_ARGS(&g_rt_state_object_ao)));
 
-        g_rt_state_object_ao->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props_ao));
+        CE(g_rt_state_object_ao->QueryInterface(IID_PPV_ARGS(&g_rt_state_object_props_ao)));
     }
 
     // CB and CBV
@@ -4006,7 +4133,9 @@ void Render()
     }
 
     DrawImGuiPanel();
-    if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty || g_compact_dispatch_replay_dirty))
+    SyncLegacyCompactFlag();
+    const GpuDispatchReplayMode gpu_replay_mode = CurrentGpuDispatchReplayMode();
+    if (g_use_ray_in_pix && UsesWavefrontData(gpu_replay_mode) && (g_dispatch_ray_mapping_dirty || g_dispatch_ray_gpu_dirty || g_compact_dispatch_replay_dirty))
     {
         UpdateCompactDispatchReplayGpuBuffers();
     }
@@ -4025,7 +4154,26 @@ void Render()
     cb.ao_samples = g_ao_sample_count;
     cb.use_ray_binning = false;
     cb.ao_radius       = g_ao_radius;
-    cb.load_ray_from_buffer = g_use_ray_in_pix ? (g_use_gpu_compact_dispatch_rays ? 5u : 1u) : 0u;
+    cb.load_ray_from_buffer = 0u;
+    if (g_use_ray_in_pix)
+    {
+        switch (gpu_replay_mode)
+        {
+        case GpuDispatchReplayMode::kWavefront:
+            cb.load_ray_from_buffer = 5u;
+            break;
+        case GpuDispatchReplayMode::kPersistentWarp:
+            cb.load_ray_from_buffer = 9u;
+            break;
+        case GpuDispatchReplayMode::kPersistentWavefront:
+            cb.load_ray_from_buffer = 17u;
+            break;
+        case GpuDispatchReplayMode::kDirect:
+        default:
+            cb.load_ray_from_buffer = 1u;
+            break;
+        }
+    }
     cb.buffer_w             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.x : g_ray_in_pix_dispatch_dims.x;
     cb.buffer_h             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.y : g_ray_in_pix_dispatch_dims.y;
     cb.buffer_d             = g_use_ray_in_pix ? g_gpu_dispatch_ray_dims.z : g_ray_in_pix_dispatch_dims.z;
@@ -4086,6 +4234,7 @@ void Render()
                 CompactReplayRootConstants compact_constants{};
                 g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
                 g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
+                g_command_list->SetComputeRootDescriptorTable(4, GpuDescriptor(13));
                 g_command_list->SetPipelineState1(g_rt_state_object);
                 desc.RayGenerationShaderRecord.StartAddress = g_raygen_sbt_storage->GetGPUVirtualAddress();
                 desc.RayGenerationShaderRecord.SizeInBytes  = 64;
@@ -4093,7 +4242,7 @@ void Render()
                 desc.MissShaderTable.SizeInBytes            = 64;
                 desc.HitGroupTable.StartAddress             = g_hit_sbt_storage->GetGPUVirtualAddress();
                 desc.HitGroupTable.SizeInBytes              = 64;
-                if (g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+                if (g_use_ray_in_pix && UsesWavefrontData(gpu_replay_mode))
                 {
                     g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
                     g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
@@ -4104,6 +4253,12 @@ void Render()
                     compact_constants.compact_mode = 0;
                     g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
                     g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
+                    if (gpu_replay_mode == GpuDispatchReplayMode::kPersistentWarp)
+                    {
+                        compact_constants.compact_mode = 3;
+                        g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                        g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
+                    }
 
                     D3D12_RESOURCE_BARRIER uav_barriers[3]{};
                     for (auto& uav_barrier : uav_barriers)
@@ -4116,44 +4271,71 @@ void Render()
                     g_command_list->ResourceBarrier(3, uav_barriers);
 
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
-                    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+                    if (gpu_replay_mode == GpuDispatchReplayMode::kWavefront)
                     {
-                        const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
-                        const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
-                        const uint32_t batch_count = batch_end - batch_begin;
-                        if (batch_count == 0)
+                        for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
                         {
-                            continue;
-                        }
-                        const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
-                        const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
-                        const uint32_t range_count = range_end - range_begin;
-                        if (range_count == 0)
-                        {
-                            continue;
-                        }
+                            const uint32_t batch_begin = g_compact_dispatch_replay.batch_offsets[batch];
+                            const uint32_t batch_end = g_compact_dispatch_replay.batch_offsets[batch + 1];
+                            const uint32_t batch_count = batch_end - batch_begin;
+                            if (batch_count == 0)
+                            {
+                                continue;
+                            }
+                            const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
+                            const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
+                            const uint32_t range_count = range_end - range_begin;
+                            if (range_count == 0)
+                            {
+                                continue;
+                            }
 
-                        g_command_list->SetComputeRootSignature(g_global_rootsig);
-                        g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
-                        g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
-                        compact_constants = {};
-                        compact_constants.batch_base = batch_begin;
-                        compact_constants.compact_mode = 1;
-                        g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
-                        g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
-                        g_command_list->SetPipelineState1(g_rt_state_object);
-                        desc.Width = batch_count;
-                        desc.Height = 1;
-                        desc.Depth = 1;
-                        g_command_list->DispatchRays(&desc);
-                        if (g_compact_dispatch_batch_barrier)
+                            g_command_list->SetComputeRootSignature(g_global_rootsig);
+                            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+                            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                            compact_constants = {};
+                            compact_constants.batch_base = batch_begin;
+                            compact_constants.compact_mode = 1;
+                            g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                            g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
+                            g_command_list->SetComputeRootDescriptorTable(4, GpuDescriptor(13));
+                            g_command_list->SetPipelineState1(g_rt_state_object);
+                            desc.Width = batch_count;
+                            desc.Height = 1;
+                            desc.Depth = 1;
+                            g_command_list->DispatchRays(&desc);
+                            if (g_compact_dispatch_batch_barrier)
+                            {
+                                g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const uint32_t work_count = gpu_replay_mode == GpuDispatchReplayMode::kPersistentWarp
+                            ? static_cast<uint32_t>(g_compact_dispatch_replay.active_pixel_indices.size())
+                            : static_cast<uint32_t>(g_compact_dispatch_replay.rays.size());
+                        if (work_count > 0)
                         {
-                            g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                            g_command_list->SetComputeRootSignature(g_global_rootsig);
+                            g_command_list->SetComputeRootDescriptorTable(0, srv_uav_cbv_handle);
+                            g_command_list->SetComputeRootDescriptorTable(1, pix_rays_dump_handle);
+                            compact_constants = {};
+                            compact_constants.batch_base = work_count;
+                            compact_constants.compact_mode = 1;
+                            g_command_list->SetComputeRoot32BitConstants(2, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                            g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(10));
+                            g_command_list->SetComputeRootDescriptorTable(4, GpuDescriptor(13));
+                            g_command_list->SetPipelineState1(g_rt_state_object);
+                            desc.Width = PersistentWorkGroupSize() * PersistentWorkGroupCount();
+                            desc.Height = 1;
+                            desc.Depth = 1;
+                            g_command_list->DispatchRays(&desc);
                         }
                     }
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
                     const bool dump_compact_ray_results_this_frame =
-                        g_dump_ray_results_requested && g_compact_ray_results_buffer != nullptr && !g_compact_dispatch_replay.rays.empty();
+                        g_dump_ray_results_requested && UsesRayResultBuffer(gpu_replay_mode) && g_compact_ray_results_buffer != nullptr && !g_compact_dispatch_replay.rays.empty();
                     if (dump_compact_ray_results_this_frame)
                     {
                         const uint64_t dump_size = static_cast<uint64_t>(g_compact_dispatch_replay.rays.size()) * sizeof(float) * 4;
@@ -4176,29 +4358,113 @@ void Render()
                             g_ray_results_readback_path = std::filesystem::path("output") /
                                                                   base_name /
                                                                   ("raytype" + std::to_string(ray_type_index)) /
-                                                                  "compact" /
+                                                                  "wavefront" /
                                                                   "CompactRayResults.bin";
                             g_ray_results_readback_count = static_cast<uint32_t>(g_compact_dispatch_replay.rays.size());
                             g_ray_results_readback_pending = true;
                         }
                         g_dump_ray_results_requested = false;
                     }
+                    else if (g_dump_ray_results_requested && gpu_replay_mode == GpuDispatchReplayMode::kPersistentWarp)
+                    {
+                        if (EnsureRayResultsTextureReadbackBuffer())
+                        {
+                            D3D12_RESOURCE_BARRIER copy_barrier = barrier_rt_out;
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+
+                            D3D12_TEXTURE_COPY_LOCATION dst{};
+                            dst.pResource        = g_ray_results_texture_readback_buffer;
+                            dst.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            dst.PlacedFootprint  = g_ray_results_texture_readback_footprint;
+
+                            D3D12_TEXTURE_COPY_LOCATION src{};
+                            src.pResource        = g_rt_output_resource;
+                            src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            src.SubresourceIndex = 0;
+                            g_command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+                            copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            copy_barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            g_command_list->ResourceBarrier(1, &copy_barrier);
+
+                            const std::string base_name = CurrentDumpBaseName();
+                            const int ray_type_index = CurrentVisibleRayTypeIndex();
+                            g_ray_results_texture_readback_path = std::filesystem::path("output") /
+                                                                  base_name /
+                                                                  ("raytype" + std::to_string(ray_type_index)) /
+                                                                  "persistent_warp" /
+                                                                  "RayResultsRGBA8.bin";
+                            g_ray_results_texture_readback_width = static_cast<uint32_t>(RT_W);
+                            g_ray_results_texture_readback_height = static_cast<uint32_t>(RT_H);
+                            g_ray_results_texture_readback_pending = true;
+                        }
+                        g_dump_ray_results_requested = false;
+                    }
                     else
                     {
-                        g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                        if (UsesRayResultBuffer(gpu_replay_mode))
+                        {
+                            g_command_list->ResourceBarrier(1, &uav_barriers[0]);
+                        }
                     }
 
                     
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
-                    for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
+                    if (gpu_replay_mode == GpuDispatchReplayMode::kWavefront)
                     {
-                        const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
-                        const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
-                        const uint32_t range_count = range_end - range_begin;
-                        if (range_count == 0)
+                        for (uint32_t batch = 0; batch + 1 < g_compact_dispatch_replay.batch_offsets.size(); batch++)
                         {
-                            continue;
+                            const uint32_t range_begin = g_compact_dispatch_replay.batch_pixel_range_offsets[batch];
+                            const uint32_t range_end = g_compact_dispatch_replay.batch_pixel_range_offsets[batch + 1];
+                            const uint32_t range_count = range_end - range_begin;
+                            if (range_count == 0)
+                            {
+                                continue;
+                            }
+                            g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
+                            g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
+                            g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
+                            g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
+                            g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
+                            g_command_list->SetPipelineState(g_compact_reduce_pso);
+                            compact_constants = {};
+                            compact_constants.batch_base = range_count;
+                            compact_constants.compact_mode = 1;
+                            compact_constants.pixel_offset_base = range_begin;
+                            compact_constants.pixel_index_base = 0;
+                            g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                            g_command_list->Dispatch((range_count + 63) / 64, 1, 1);
+                            g_command_list->ResourceBarrier(2, &uav_barriers[1]);
                         }
+                    }
+                    else if (gpu_replay_mode == GpuDispatchReplayMode::kPersistentWavefront)
+                    {
+                        const uint32_t range_count = static_cast<uint32_t>(g_compact_dispatch_replay.batch_pixel_ranges.size());
+                        if (range_count > 0)
+                        {
+                            g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
+                            g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
+                            g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
+                            g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
+                            g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
+                            g_command_list->SetPipelineState(g_compact_reduce_pso);
+                            compact_constants = {};
+                            compact_constants.batch_base = range_count;
+                            compact_constants.compact_mode = 1;
+                            compact_constants.pixel_offset_base = 0;
+                            compact_constants.pixel_index_base = 0;
+                            g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
+                            g_command_list->Dispatch((range_count + 63) / 64, 1, 1);
+                            g_command_list->ResourceBarrier(2, &uav_barriers[1]);
+                        }
+                    }
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 5);
+
+                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 6);
+                    if (UsesReducePass(gpu_replay_mode))
+                    {
                         g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
                         g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
                         g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
@@ -4206,27 +4472,10 @@ void Render()
                         g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
                         g_command_list->SetPipelineState(g_compact_reduce_pso);
                         compact_constants = {};
-                        compact_constants.batch_base = range_count;
-                        compact_constants.compact_mode = 1;
-                        compact_constants.pixel_offset_base = range_begin;
-                        compact_constants.pixel_index_base = 0;
+                        compact_constants.compact_mode = 2;
                         g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
-                        g_command_list->Dispatch((range_count + 63) / 64, 1, 1);
-                        g_command_list->ResourceBarrier(2, &uav_barriers[1]);
+                        g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
                     }
-                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 5);
-
-                    g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 6);
-                    g_command_list->SetComputeRootSignature(g_compact_reduce_rootsig);
-                    g_command_list->SetComputeRootDescriptorTable(0, GpuDescriptor(0));
-                    g_command_list->SetComputeRootDescriptorTable(1, GpuDescriptor(10));
-                    g_command_list->SetComputeRootDescriptorTable(2, GpuDescriptor(13));
-                    g_command_list->SetComputeRootDescriptorTable(3, GpuDescriptor(2));
-                    g_command_list->SetPipelineState(g_compact_reduce_pso);
-                    compact_constants = {};
-                    compact_constants.compact_mode = 2;
-                    g_command_list->SetComputeRoot32BitConstants(4, sizeof(CompactReplayRootConstants) / sizeof(uint32_t), &compact_constants, 0);
-                    g_command_list->Dispatch((RT_W * RT_H + 63) / 64, 1, 1);
                     g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 7);
                 }
                 else
@@ -4326,7 +4575,7 @@ void Render()
             }
 
             g_command_list->EndQuery(g_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-            const bool measure_compact_dispatch_rays = !g_use_ao && g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays;
+            const bool measure_compact_dispatch_rays = !g_use_ao && g_use_ray_in_pix && UsesWavefrontData(gpu_replay_mode);
             g_command_list->ResolveQueryData(g_query_heap,
                                              D3D12_QUERY_TYPE_TIMESTAMP,
                                              0,
@@ -4434,7 +4683,7 @@ void Render()
         const float reduce_time                = g_compact_reduce_time.GetFrameTime();
 
         g_app_state.last_gpu_frame_ms = frame_time_ms;
-        if (!g_use_ao && g_use_ray_in_pix && g_use_gpu_compact_dispatch_rays)
+        if (!g_use_ao && g_use_ray_in_pix && UsesWavefrontData(gpu_replay_mode))
         {
             const float compact_dispatch_sec = (timestamps[3] - timestamps[2]) * 1.0f / freq;
             g_compact_dispatch_rays_time.AddSample(compact_dispatch_sec);

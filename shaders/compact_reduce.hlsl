@@ -44,6 +44,10 @@ void CSMain(uint3 dispatch_id : SV_DispatchThreadID)
     if (compact_mode == 0)
     {
         const uint pixel = dispatch_id.x;
+        if (pixel == 0)
+        {
+            CompactAccumCount[rt_w * rt_h] = 0;
+        }
         if (pixel >= rt_w * rt_h)
         {
             return;
@@ -73,6 +77,26 @@ void CSMain(uint3 dispatch_id : SV_DispatchThreadID)
         }
         CompactAccumColor[pixel] = sum;
         CompactAccumCount[pixel] = count;
+        return;
+    }
+
+    if (compact_mode == 3)
+    {
+        const uint pixel = dispatch_id.x;
+        if (pixel >= rt_w * rt_h)
+        {
+            return;
+        }
+        const uint x = pixel % rt_w;
+        const uint y = pixel / rt_w;
+        const uint xx = x % 16;
+        const uint yy = y % 16;
+        float4 c = float4(1, 1, 0, 1);
+        if ((xx < 8 && yy < 8) || (xx >= 8 && yy >= 8))
+        {
+            c = float4(0.5, 0.5, 0.5, 1);
+        }
+        RenderTarget[uint2(x, y)] = c;
         return;
     }
 
