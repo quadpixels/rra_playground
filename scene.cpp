@@ -74,11 +74,39 @@ uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
                                     uint32_t node,
                                     std::vector<glm::vec3>* geom_verts,
                                     SceneBlasTopology* topology,
-                                    uint32_t* triangle_count)
+                                    uint32_t* triangle_count,
+                                    std::array<glm::mat3, 104>* obb_rotations,
+                                    std::array<bool, 104>* obb_rotation_valid)
 {
     SceneBlasBvhNode out_node{};
     const uint32_t topology_index = static_cast<uint32_t>(topology->nodes.size());
     topology->nodes.push_back({});
+
+    if (blas_index > 0)
+    {
+        BoundingVolumeExtents extents{};
+        if (RraBlasGetBoundingVolumeExtents(blas_index, node, &extents) == kRraOk)
+        {
+            out_node.bounds.min = glm::vec3(extents.min_x, extents.min_y, extents.min_z);
+            out_node.bounds.max = glm::vec3(extents.max_x, extents.max_y, extents.max_z);
+            out_node.bounds_valid = true;
+        }
+
+        uint32_t obb_index = 127;
+        if (RraBlasGetNodeObbIndex(blas_index, node, &obb_index) == kRraOk && obb_index < 104)
+        {
+            out_node.obb_index = static_cast<uint8_t>(obb_index);
+            if (obb_rotations != nullptr && obb_rotation_valid != nullptr)
+            {
+                glm::mat3 rotation(1.0f);
+                if (RraBlasGetNodeBoundingVolumeOrientation(blas_index, node, &rotation[0][0]) == kRraOk)
+                {
+                    (*obb_rotations)[obb_index] = rotation;
+                    (*obb_rotation_valid)[obb_index] = true;
+                }
+            }
+        }
+    }
 
     if (IsRraBlasTriangleNode(blas_index, node))
     {
@@ -119,7 +147,8 @@ uint32_t BuildBlasTopologyRecursive(unsigned blas_index,
         {
             continue;
         }
-        const uint32_t child_index = BuildBlasTopologyRecursive(blas_index, child, geom_verts, topology, triangle_count);
+        const uint32_t child_index = BuildBlasTopologyRecursive(
+            blas_index, child, geom_verts, topology, triangle_count, obb_rotations, obb_rotation_valid);
         const SceneBlasBvhNode& child_node = topology->nodes[child_index];
         if (child_node.primitive_count == 0 && !child_node.is_leaf)
         {
@@ -373,7 +402,8 @@ bool LoadSceneFromRra(const char* rra_file_name, AppState* app_state, SceneData*
         }
 
         uint32_t num_tris = 0;
-        topology.root_index = BuildBlasTopologyRecursive(i, root_node, &geom_verts, &topology, &num_tris);
+        topology.root_index = BuildBlasTopologyRecursive(
+            i, root_node, &geom_verts, &topology, &num_tris, &scene.obb_rotations, &scene.obb_rotation_valid);
         total_tri_count += num_tris;
         scene.blas_vertices.push_back(std::move(geom_verts));
         scene.blas_topologies.push_back(std::move(topology));

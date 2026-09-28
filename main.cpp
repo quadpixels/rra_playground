@@ -3,6 +3,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include "app_state.h"
 #include "cpu_renderer.h"
 #include "scene.h"
+#include "public/rra_ray_history.h"
 
 #include "../frontend/version.h"
 
@@ -301,6 +303,12 @@ bool            g_ray_results_texture_readback_pending{false};
 uint32_t        g_ray_results_texture_readback_width{0};
 uint32_t        g_ray_results_texture_readback_height{0};
 std::filesystem::path g_ray_results_texture_readback_path;
+std::mutex            g_sbt_stats_mutex;
+std::thread           g_sbt_stats_thread;
+std::atomic<bool>     g_sbt_stats_busy{false};
+bool                  g_show_sbt_stats{false};
+std::string           g_sbt_stats_output;
+int                   g_sbt_stats_dispatch_index{-1};
 std::string    g_adapter_name{"Unknown adapter"};
 
 bool g_use_ao{false};
@@ -347,6 +355,12 @@ bool CopyToClipboard(const std::string& text)
     }
 
     char* pGlobal = (char*)GlobalLock(hGlobal);
+    if (pGlobal == nullptr)
+    {
+        GlobalFree(hGlobal);
+        CloseClipboard();
+        return false;
+    }
     memcpy(pGlobal, text.c_str(), size);
     GlobalUnlock(hGlobal);
 
@@ -378,6 +392,10 @@ uint64_t              g_cpu_request_generation{0};
 uint64_t              g_cpu_display_generation{0};
 uint32_t              g_cpu_display_tiles_completed{0};
 uint32_t              g_cpu_display_tiles_total{0};
+bool                  g_cpu_bvh_scan_requested{false};
+bool                  g_cpu_bvh_scan_busy{false};
+std::atomic<uint32_t> g_cpu_bvh_scan_current{0};
+std::string           g_cpu_bvh_scan_output;
 std::optional<CpuRenderRequest> g_pending_cpu_request;
 std::optional<CpuRenderResult>  g_latest_cpu_result;
 
@@ -1441,6 +1459,137 @@ const SceneDispatchRays* CurrentRraDispatch()
     return &g_scene_data.dispatches[g_selected_dispatch_index];
 }
 
+void StartSbtStatsScan()
+{
+    if (g_sbt_stats_busy.load() || g_scene_data.dispatches.empty())
+    {
+        return;
+    }
+
+    if (g_sbt_stats_thread.joinable())
+    {
+        g_sbt_stats_thread.join();
+    }
+
+    const int dispatch_index = std::clamp(
+        g_selected_dispatch_index, 0, static_cast<int>(g_scene_data.dispatches.size()) - 1);
+    g_sbt_stats_busy.store(true);
+    {
+        std::lock_guard<std::mutex> lock(g_sbt_stats_mutex);
+        g_sbt_stats_dispatch_index = dispatch_index;
+        g_sbt_stats_output = "Scanning dispatch ray history...\n";
+    }
+
+    g_sbt_stats_thread = std::thread([dispatch_index]() {
+        const SceneDispatchRays& dispatch = g_scene_data.dispatches[dispatch_index];
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> hit_sbt_counts;
+        std::map<uint32_t, uint64_t> miss_shader_counts;
+        uint64_t total_rays = 0;
+        uint64_t hit_rays = 0;
+        uint64_t miss_rays = 0;
+        uint64_t failed_results = 0;
+        uint32_t stored_ray_cursor = 0;
+        const uint32_t x_count = dispatch.dispatch_dims.x;
+        const uint32_t y_count = dispatch.dispatch_dims.y;
+        const uint32_t z_count = dispatch.dispatch_dims.z;
+
+        g_app_state.SetStatus("Scanning SBT usage for " + dispatch.name);
+
+        for (uint32_t z = 0; z < z_count; z++)
+        {
+            for (uint32_t y = 0; y < y_count; y++)
+            {
+                for (uint32_t x = 0; x < x_count; x++)
+                {
+                    const GlobalInvocationID gid{x, y, z};
+                    uint32_t ray_count = 0;
+                    if (RraRayGetRayCount(static_cast<uint32_t>(dispatch_index), gid, &ray_count) != kRraOk)
+                    {
+                        failed_results++;
+                        continue;
+                    }
+
+                    for (uint32_t ray_index = 0; ray_index < ray_count; ray_index++)
+                    {
+                        RraIntersectionResult intersection{};
+                        const RraErrorCode result_code = RraRayGetIntersectionResult(
+                            static_cast<uint32_t>(dispatch_index), gid, ray_index, &intersection);
+                        if (result_code != kRraOk)
+                        {
+                            failed_results++;
+                            continue;
+                        }
+
+                        const uint32_t stored_index = stored_ray_cursor + ray_index;
+                        if (stored_index >= dispatch.rays.size())
+                        {
+                            failed_results++;
+                            continue;
+                        }
+
+                        const SceneRay& ray = dispatch.rays[stored_index];
+                        total_rays++;
+                        if (intersection.hit_t >= 0.0f)
+                        {
+                            hit_rays++;
+                            hit_sbt_counts[{ray.sbt_record_offset, ray.sbt_record_stride}]++;
+                        }
+                        else
+                        {
+                            miss_rays++;
+                            miss_shader_counts[ray.miss_index]++;
+                        }
+                    }
+                    stored_ray_cursor += ray_count;
+                }
+            }
+        }
+
+        std::ostringstream output;
+        output << "Dispatch: " << dispatch.name << "\n";
+        output << "Total rays: " << total_rays << "\n";
+        output << "Hits: " << hit_rays << "\n";
+        output << "Misses: " << miss_rays << "\n";
+        if (failed_results != 0)
+        {
+            output << "Failed results: " << failed_results << "\n";
+        }
+
+        output << "\nHit SBT positions (offset, stride)\n";
+        if (hit_sbt_counts.empty())
+        {
+            output << "  <none>\n";
+        }
+        else
+        {
+            for (const auto& [position, count] : hit_sbt_counts)
+            {
+                output << "  (" << position.first << ", " << position.second << "): " << count << "\n";
+            }
+        }
+
+        output << "\nMiss shader indices\n";
+        if (miss_shader_counts.empty())
+        {
+            output << "  <none>\n";
+        }
+        else
+        {
+            for (const auto& [miss_index, count] : miss_shader_counts)
+            {
+                output << "  " << miss_index << ": " << count << "\n";
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_sbt_stats_mutex);
+            g_sbt_stats_output = output.str();
+        }
+        g_sbt_stats_busy.store(false);
+        g_app_state.SetStatus("SBT usage scan complete");
+    });
+}
+
 bool IsSingleRowDispatch(const SceneDispatchRays* dispatch)
 {
     return dispatch != nullptr && dispatch->dispatch_dims.y == 1;
@@ -2395,6 +2544,89 @@ void UploadCpuRenderTarget()
     g_command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 }
 
+void RunCpuBvhFanoutScan()
+{
+    static constexpr uint32_t kFanouts[] = {2, 4, 6, 8, 10, 12, 16};
+
+    SceneStats scene_stats{};
+    {
+        std::lock_guard<std::mutex> lock(g_app_state.details_mutex);
+        scene_stats = g_app_state.scene_stats;
+    }
+
+    std::string scene_name = scene_stats.source_name;
+    if (!scene_name.empty())
+    {
+        scene_name = std::filesystem::path(scene_name).stem().string();
+    }
+    if (scene_name.empty())
+    {
+        scene_name = "<scene>";
+    }
+
+    CpuRenderRequest request{};
+    request.width             = RT_W;
+    request.height            = RT_H;
+    request.thread_count      = static_cast<uint32_t>(std::max(1, g_cpu_thread_count));
+    request.inverse_view      = g_inv_view;
+    request.inverse_proj      = g_inv_proj;
+    request.invert_y          = g_invert_y;
+    request.use_external_rays = g_use_ray_in_pix;
+    request.backend           = RenderBackend::kCpuBvh;
+    request.render_after_build = true;
+    if (request.use_external_rays)
+    {
+        request.external_rays = BuildCpuExternalRays();
+        request.external_ray_offsets = g_display_ray_offsets;
+    }
+
+    std::ostringstream table;
+    table << "Scene\tFanout\tRays\tSteps\tBoxNodes\tRayBoxTests\tTriNodes\tRayTriTests\tTLAS->BLAS\n";
+
+    for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(kFanouts)); i++)
+    {
+        const uint32_t fanout = kFanouts[i];
+        g_cpu_bvh_scan_current.store(i + 1);
+        g_app_state.SetStatus("Scanning CPU BVH fanout " + std::to_string(fanout));
+
+        CpuBvhSettings settings = CurrentCpuBvhSettings();
+        settings.fanout = fanout;
+        // This scan intentionally measures generated BVHs only.
+        settings.build_mode = CpuBvhBuildMode::kWideMedian;
+        request.bvh_settings = settings;
+        request.rebuild_bvh = true;
+
+        {
+            std::lock_guard<std::mutex> renderer_lock(g_cpu_renderer_mutex);
+            g_cpu_renderer.BuildFromScene(g_scene_data, settings, &g_app_state);
+            CpuRenderResult result{};
+            g_cpu_renderer.Render(request, &result);
+
+            const CpuRenderStats& s = result.stats;
+            table << scene_name << '\t'
+                  << fanout << '\t'
+                  << s.rays << '\t'
+                  << s.bvh_steps << '\t'
+                  << s.box_nodes << '\t'
+                  << s.ray_box_tests << '\t'
+                  << s.tri_nodes << '\t'
+                  << s.ray_triangle_tests << '\t'
+                  << s.tlas_to_blas << '\n';
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        g_cpu_bvh_scan_output = table.str();
+        g_cpu_bvh_scan_current.store(static_cast<uint32_t>(std::size(kFanouts)));
+        g_cpu_bvh_scan_busy = false;
+        g_cpu_bvh_scan_requested = false;
+        g_cpu_refresh_requested = true;
+        g_cpu_bvh_rebuild_requested.store(true);
+    }
+    g_app_state.SetStatus("CPU BVH fanout scan complete");
+}
+
 void CpuWorkerMain()
 {
     while (true)
@@ -2402,10 +2634,21 @@ void CpuWorkerMain()
         CpuRenderRequest request{};
         {
             std::unique_lock<std::mutex> lock(g_cpu_worker_mutex);
-            g_cpu_worker_cv.wait(lock, []() { return g_cpu_worker_exit || g_cpu_request_pending; });
+            g_cpu_worker_cv.wait(lock, []() { return g_cpu_worker_exit || g_cpu_request_pending || g_cpu_bvh_scan_requested; });
             if (g_cpu_worker_exit)
             {
                 return;
+            }
+            if (g_cpu_bvh_scan_requested && !g_cpu_request_pending)
+            {
+                g_cpu_bvh_scan_busy = true;
+                g_cpu_worker_busy = true;
+                lock.unlock();
+                RunCpuBvhFanoutScan();
+                lock.lock();
+                g_cpu_worker_busy = false;
+                g_cpu_worker_stage.store(CpuWorkerStage::kIdle);
+                continue;
             }
             request               = *g_pending_cpu_request;
             g_cpu_request_pending = false;
@@ -2516,6 +2759,11 @@ void DrawImGuiPanel()
     bool cpu_bvh_uses_binned_sah = false;
     std::string status_line;
     std::string last_error;
+    std::string cpu_bvh_scan_output;
+    bool cpu_bvh_scan_busy = false;
+    uint32_t cpu_bvh_scan_current = 0;
+    std::string sbt_stats_output;
+    int sbt_stats_dispatch_index = -1;
     {
         std::lock_guard<std::mutex> lock(g_app_state.details_mutex);
         stats       = g_app_state.scene_stats;
@@ -2528,6 +2776,17 @@ void DrawImGuiPanel()
         cpu_bvh_uses_binned_sah = g_app_state.cpu_bvh_uses_binned_sah;
         status_line = g_app_state.status_line;
         last_error  = g_app_state.last_error;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+        cpu_bvh_scan_output = g_cpu_bvh_scan_output;
+        cpu_bvh_scan_busy = g_cpu_bvh_scan_busy || g_cpu_bvh_scan_requested;
+        cpu_bvh_scan_current = g_cpu_bvh_scan_current.load();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sbt_stats_mutex);
+        sbt_stats_output = g_sbt_stats_output;
+        sbt_stats_dispatch_index = g_sbt_stats_dispatch_index;
     }
 
     ImGui::SetNextWindowBgAlpha(0.82f);
@@ -2720,6 +2979,44 @@ void DrawImGuiPanel()
                 {
                     ImGui::EndDisabled();
                 }
+
+                if (ImGui::Button("Scan CPU BVH fanouts") && !cpu_bvh_scan_busy)
+                {
+                    if (g_dispatch_ray_mapping_dirty)
+                    {
+                        RebuildDisplayDispatchRays();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_cpu_worker_mutex);
+                        g_cpu_bvh_scan_output.clear();
+                        g_cpu_bvh_scan_current.store(0);
+                        g_cpu_bvh_scan_requested = true;
+                    }
+                    g_cpu_worker_cv.notify_one();
+                }
+                if (cpu_bvh_scan_busy)
+                {
+                    ImGui::Text("Fanout scan: %u / 7", cpu_bvh_scan_current);
+                }
+                if (!cpu_bvh_scan_output.empty())
+                {
+                    ImGui::Text("Fanout scan result");
+                    std::vector<char> scan_buffer(cpu_bvh_scan_output.begin(), cpu_bvh_scan_output.end());
+                    scan_buffer.push_back('\0');
+                    ImGui::InputTextMultiline("##CpuBvhFanoutScan",
+                                              scan_buffer.data(),
+                                              scan_buffer.size(),
+                                              ImVec2(-1.0f, 150.0f),
+                                              ImGuiInputTextFlags_ReadOnly);
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip("Click to copy the complete BVH fanout table");
+                    }
+                    if (ImGui::IsItemClicked())
+                    {
+                        CopyToClipboard(cpu_bvh_scan_output);
+                    }
+                }
             }
 
             if (g_cpu_worker_busy)
@@ -2761,6 +3058,47 @@ void DrawImGuiPanel()
                 if (dispatch != nullptr && ImGui::Button("RT = dispatch"))
                 {
                     ApplyDispatchViewportPolicy(dispatch);
+                }
+
+                ImGui::SameLine();
+                if (g_sbt_stats_busy.load())
+                {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Button("Scan SBT usage"))
+                {
+                    StartSbtStatsScan();
+                }
+                if (g_sbt_stats_busy.load())
+                {
+                    ImGui::EndDisabled();
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Show SBT stats", &g_show_sbt_stats);
+
+                if (g_sbt_stats_busy.load())
+                {
+                    ImGui::Text("SBT scan in progress...");
+                }
+                if (g_show_sbt_stats &&
+                    !sbt_stats_output.empty() &&
+                    sbt_stats_dispatch_index == g_selected_dispatch_index)
+                {
+                    std::vector<char> sbt_buffer(sbt_stats_output.begin(), sbt_stats_output.end());
+                    sbt_buffer.push_back('\0');
+                    ImGui::InputTextMultiline("##SbtUsageStats",
+                                              sbt_buffer.data(),
+                                              sbt_buffer.size(),
+                                              ImVec2(-1.0f, 180.0f),
+                                              ImGuiInputTextFlags_ReadOnly);
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip("Click to copy SBT usage statistics");
+                    }
+                    if (ImGui::IsItemClicked())
+                    {
+                        CopyToClipboard(sbt_stats_output);
+                    }
                 }
             }
             else
@@ -2898,7 +3236,24 @@ void DrawImGuiPanel()
         if (!last_error.empty())
         {
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", last_error.c_str());
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Error output");
+
+            // Keep the diagnostic text selectable and make the whole field a copy target.
+            std::vector<char> error_buffer(last_error.begin(), last_error.end());
+            error_buffer.push_back('\0');
+            ImGui::InputTextMultiline("##ErrorOutput",
+                                      error_buffer.data(),
+                                      error_buffer.size(),
+                                      ImVec2(-1.0f, 90.0f),
+                                      ImGuiInputTextFlags_ReadOnly);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("Click to copy the complete error output");
+            }
+            if (ImGui::IsItemClicked())
+            {
+                CopyToClipboard(last_error);
+            }
         }
 
         auto check_hover_stats = [&]() {
@@ -5346,6 +5701,10 @@ int main(int argc, char** argv)
     if (g_cpu_worker_thread.joinable())
     {
         g_cpu_worker_thread.join();
+    }
+    if (g_sbt_stats_thread.joinable())
+    {
+        g_sbt_stats_thread.join();
     }
     ShutdownImGui();
 

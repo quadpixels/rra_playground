@@ -223,6 +223,7 @@ CpuPrimaryRayRenderer::BvhNode::ChildNode MakeChildFromNode(
     CpuPrimaryRayRenderer::BvhNode::ChildNode child{};
     child.index = node_index;
     child.aabb  = nodes[node_index].bounds;
+    child.obb_index = nodes[node_index].obb_index;
     child.type  = nodes[node_index].kind == CpuPrimaryRayRenderer::BvhNode::Kind::kTriangle
                     ? CpuPrimaryRayRenderer::BvhNode::SubnodeType::kTriangle
                     : CpuPrimaryRayRenderer::BvhNode::SubnodeType::kBox;
@@ -700,6 +701,14 @@ struct BlasTranscribeContext
     uint32_t primitive_node_triangle_capacity{3};
 };
 
+CpuPrimaryRayRenderer::Aabb ToCpuAabb(const SceneAabb& bounds)
+{
+    CpuPrimaryRayRenderer::Aabb result{};
+    result.min = bounds.min;
+    result.max = bounds.max;
+    return result;
+}
+
 bool TranscribeBlasNode(const BlasTranscribeContext& context,
                         uint32_t blas_index,
                         uint32_t source_node_index,
@@ -739,11 +748,17 @@ bool TranscribeBlasNode(const BlasTranscribeContext& context,
                                                   count,
                                                   context.fanout,
                                                   context.primitive_node_triangle_capacity);
+        context.nodes[*out_node_index].obb_index = source_node.obb_index;
+        if (source_node.bounds_valid)
+        {
+            context.nodes[*out_node_index].bounds = ToCpuAabb(source_node.bounds);
+        }
         return true;
     }
 
     context.nodes[node_index].kind = CpuPrimaryRayRenderer::BvhNode::Kind::kInternal;
-    context.nodes[node_index].bounds = EmptyAabb();
+    context.nodes[node_index].obb_index = source_node.obb_index;
+    context.nodes[node_index].bounds = source_node.bounds_valid ? ToCpuAabb(source_node.bounds) : EmptyAabb();
     for (uint32_t child_source_index : source_node.children)
     {
         uint32_t child_node_index = 0;
@@ -753,7 +768,10 @@ bool TranscribeBlasNode(const BlasTranscribeContext& context,
         }
         CpuPrimaryRayRenderer::BvhNode& node = context.nodes[node_index];
         node.children[node.child_count++] = MakeChildFromNode(context.nodes, child_node_index);
-        ExpandAabb(&node.bounds, context.nodes[child_node_index].bounds);
+        if (!source_node.bounds_valid)
+        {
+            ExpandAabb(&node.bounds, context.nodes[child_node_index].bounds);
+        }
     }
 
     *out_node_index = node_index;
@@ -858,6 +876,8 @@ bool TranscribeTlasNode(const TlasTranscribeContext& context, uint32_t source_no
 void CpuPrimaryRayRenderer::BuildFromScene(const SceneData& scene, const CpuBvhSettings& settings, AppState* app_state)
 {
     mesh_vertices_ = scene.blas_vertices;
+    obb_rotations_ = scene.obb_rotations;
+    obb_rotation_valid_ = scene.obb_rotation_valid;
     instances_.clear();
     blases_.clear();
     tlas_refs_.clear();
@@ -1049,6 +1069,8 @@ bool TraceBruteForce(const std::vector<std::vector<glm::vec3>>& mesh_vertices,
 
 bool TraceBlasBvh(const std::vector<glm::vec3>& verts,
                   const CpuPrimaryRayRenderer::CpuBlas& blas,
+                  const std::array<glm::mat3, 104>& obb_rotations,
+                  const std::array<bool, 104>& obb_rotation_valid,
                   uint32_t instance_index,
                   const glm::vec3& local_origin,
                   const glm::vec3& local_direction,
@@ -1062,9 +1084,17 @@ bool TraceBlasBvh(const std::vector<glm::vec3>& verts,
         return false;
     }
 
-    const glm::vec3 inv_dir(1.0f / local_direction.x, 1.0f / local_direction.y, 1.0f / local_direction.z);
-    //stats->ray_box_tests++; //Self
-    if (!IntersectAabb(blas.nodes[blas.root_index].bounds, local_origin, inv_dir, tmin, tmax))
+    glm::vec3 root_origin = local_origin;
+    glm::vec3 root_direction = local_direction;
+    const uint8_t root_obb_index = blas.nodes[blas.root_index].obb_index;
+    if (root_obb_index < 104 && obb_rotation_valid[root_obb_index])
+    {
+        const glm::mat3 w2o = glm::transpose(obb_rotations[root_obb_index]);
+        root_origin = w2o * root_origin;
+        root_direction = w2o * root_direction;
+    }
+    const glm::vec3 root_inv_dir(1.0f / root_direction.x, 1.0f / root_direction.y, 1.0f / root_direction.z);
+    if (!IntersectAabb(blas.nodes[blas.root_index].bounds, root_origin, root_inv_dir, tmin, tmax))
     {
         return false;
     }
@@ -1115,8 +1145,18 @@ bool TraceBlasBvh(const std::vector<glm::vec3>& verts,
                 {
                     continue;
                 }
+                glm::vec3 child_origin = local_origin;
+                glm::vec3 child_direction = local_direction;
+                if (child.obb_index < 104 && obb_rotation_valid[child.obb_index])
+                {
+                    const glm::mat3 w2o = glm::transpose(obb_rotations[child.obb_index]);
+                    child_origin = w2o * child_origin;
+                    child_direction = w2o * child_direction;
+                }
+                const glm::vec3 child_inv_dir(
+                    1.0f / child_direction.x, 1.0f / child_direction.y, 1.0f / child_direction.z);
                 stats->ray_box_tests++;
-                if (!IntersectAabb(child.aabb, local_origin, inv_dir, tmin, std::min(tmax, hit->t)))
+                if (!IntersectAabb(child.aabb, child_origin, child_inv_dir, tmin, std::min(tmax, hit->t)))
                 {
                     continue;
                 }
@@ -1131,6 +1171,8 @@ bool TraceBlasBvh(const std::vector<glm::vec3>& verts,
 bool TraceTlasBlasBvh(const std::vector<std::vector<glm::vec3>>& mesh_vertices,
                       const std::vector<CpuPrimaryRayRenderer::InstanceData>& instances,
                       const std::vector<CpuPrimaryRayRenderer::CpuBlas>& blases,
+                      const std::array<glm::mat3, 104>& obb_rotations,
+                      const std::array<bool, 104>& obb_rotation_valid,
                       const std::vector<CpuPrimaryRayRenderer::BuildRef>& tlas_refs,
                       const std::vector<CpuPrimaryRayRenderer::BvhNode>& tlas_nodes,
                       uint32_t tlas_root_index,
@@ -1201,6 +1243,8 @@ bool TraceTlasBlasBvh(const std::vector<std::vector<glm::vec3>>& mesh_vertices,
                     stats->tlas_to_blas++;
                     TraceBlasBvh(mesh_vertices[instance.mesh_index],
                                  blas,
+                                 obb_rotations,
+                                 obb_rotation_valid,
                                  instance_index,
                                  local_origin,
                                  local_dir,
@@ -1342,7 +1386,20 @@ void CpuPrimaryRayRenderer::Render(const CpuRenderRequest& request,
                             HitInfo hit;
                             const bool did_hit =
                                 request.backend == RenderBackend::kCpuBvh
-                                    ? TraceTlasBlasBvh(mesh_vertices_, instances_, blases_, tlas_refs_, tlas_nodes_, tlas_root_index_, ray.origin, ray.direction, ray.tmin, ray.tmax, &tile_stats, &hit)
+                                    ? TraceTlasBlasBvh(mesh_vertices_,
+                                                       instances_,
+                                                       blases_,
+                                                       obb_rotations_,
+                                                       obb_rotation_valid_,
+                                                       tlas_refs_,
+                                                       tlas_nodes_,
+                                                       tlas_root_index_,
+                                                       ray.origin,
+                                                       ray.direction,
+                                                       ray.tmin,
+                                                       ray.tmax,
+                                                       &tile_stats,
+                                                       &hit)
                                     : TraceBruteForce(mesh_vertices_, instances_, ray.origin, ray.direction, ray.tmin, ray.tmax, &tile_stats, &hit);
 
                             glm::vec4 ray_color = ShadeMiss(y, request.height);

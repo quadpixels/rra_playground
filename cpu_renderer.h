@@ -122,6 +122,7 @@ public:
         struct ChildNode
         {
             SubnodeType type{SubnodeType::kEmpty};
+            uint8_t     obb_index{127};
             Aabb        aabb{};
             uint32_t    index{0};
         };
@@ -136,6 +137,7 @@ public:
 
         Kind                       kind{Kind::kInternal};
         Aabb                       bounds{};
+        uint8_t                    obb_index{127};
         std::array<ChildNode, 16>  children{};
         uint32_t                   child_count{0};
         std::array<TrianglePrimitive, 3> triangles{};
@@ -165,6 +167,8 @@ public:
     std::vector<CpuBlas>                blases_;
     std::vector<BuildRef>               tlas_refs_;
     std::vector<BvhNode>                tlas_nodes_;
+    std::array<glm::mat3, 104>          obb_rotations_{};
+    std::array<bool, 104>               obb_rotation_valid_{};
     uint32_t                            tlas_root_index_{0};
     uint32_t                            bvh_fanout_{2};
     uint32_t                            primitive_node_triangle_capacity_{3};

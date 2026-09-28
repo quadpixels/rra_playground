@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -23,12 +24,21 @@ struct SceneCamera
     std::string preset_name;
 };
 
+struct SceneAabb
+{
+    glm::vec3 min{0.0f};
+    glm::vec3 max{0.0f};
+};
+
 struct SceneBlasBvhNode
 {
     std::vector<uint32_t> children;
     uint32_t              primitive_start{0};
     uint32_t              primitive_count{0};
     bool                  is_leaf{false};
+    SceneAabb             bounds{};
+    bool                  bounds_valid{false};
+    uint8_t               obb_index{127};
 };
 
 struct SceneBlasTopology
@@ -81,6 +91,8 @@ struct SceneData
     SceneTlasTopology                   tlas_topology;
     std::vector<SceneDispatchRays>      dispatches;
     SceneCamera                         camera;
+    std::array<glm::mat3, 104>          obb_rotations{};
+    std::array<bool, 104>               obb_rotation_valid{};
     SceneStats                          stats;
 };
 
